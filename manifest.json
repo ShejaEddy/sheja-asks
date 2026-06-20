@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "Sheja Asks",
+  "version": "1.2",
+  "description": "AI-powered quiz helper — get answers as you play",
+  "permissions": [
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Sheja Asks"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://*.quiz.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ]
+}

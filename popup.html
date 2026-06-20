@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Sheja Asks — Settings</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            width: 300px;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #faf9ff;
+            color: #1e1b4b;
+        }
+
+        header {
+            padding: 16px;
+            background: linear-gradient(135deg, #6c63ff, #a78bfa);
+        }
+        header h1 {
+            font-size: 16px;
+            font-weight: 700;
+            color: #fff;
+        }
+        header p {
+            font-size: 11px;
+            color: rgba(255,255,255,.75);
+            margin-top: 3px;
+        }
+
+        #qa-tabs {
+            display: flex;
+            background: #fff;
+            border-bottom: 1px solid #ede9fe;
+        }
+        .qa-tab {
+            flex: 1;
+            padding: 10px 4px;
+            background: none;
+            border: none;
+            color: #9ca3af;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: color .15s;
+            position: relative;
+        }
+        .qa-tab:hover { color: #7c3aed; }
+        .qa-tab.active {
+            color: #6c63ff;
+            background: #faf9ff;
+        }
+        .qa-tab.active::after {
+            content: '';
+            position: absolute;
+            bottom: 0; left: 0; right: 0;
+            height: 2px;
+            background: linear-gradient(90deg, #6c63ff, #a78bfa);
+        }
+        .badge {
+            font-size: 9px;
+            background: #dcfce7;
+            color: #16a34a;
+            padding: 1px 5px;
+            border-radius: 8px;
+            margin-left: 3px;
+            vertical-align: middle;
+            font-weight: 700;
+        }
+        .qa-dot {
+            display: inline-block;
+            width: 5px; height: 5px;
+            background: #22c55e;
+            border-radius: 50%;
+            margin-left: 4px;
+            vertical-align: middle;
+            opacity: 0;
+            transition: opacity .2s;
+        }
+        .qa-dot.visible { opacity: 1; }
+
+        main { padding: 14px 16px; background: #faf9ff; }
+
+        .qa-field { margin-bottom: 12px; }
+        label {
+            display: block;
+            font-size: 10px;
+            font-weight: 800;
+            letter-spacing: .8px;
+            color: #8b5cf6;
+            text-transform: uppercase;
+            margin-bottom: 5px;
+        }
+        input {
+            width: 100%;
+            padding: 9px 11px;
+            background: #fff;
+            border: 1.5px solid #ddd6fe;
+            border-radius: 8px;
+            color: #1e1b4b;
+            font-size: 12px;
+            outline: none;
+            transition: border-color .15s;
+        }
+        input:focus { border-color: #7c3aed; }
+        .qa-hint {
+            font-size: 11px;
+            color: #9ca3af;
+            margin-top: 5px;
+        }
+        .qa-hint a { color: #7c3aed; text-decoration: none; }
+        .qa-hint a:hover { text-decoration: underline; }
+        .qa-model {
+            display: inline-block;
+            font-size: 10px;
+            background: #f5f3ff;
+            color: #7c3aed;
+            border: 1px solid #ddd6fe;
+            border-radius: 5px;
+            padding: 3px 8px;
+            margin-top: 6px;
+            font-weight: 600;
+        }
+
+        #save {
+            width: 100%;
+            padding: 10px;
+            background: linear-gradient(135deg, #6c63ff, #a78bfa);
+            border: none;
+            border-radius: 8px;
+            color: #fff;
+            font-size: 13px;
+            font-weight: 700;
+            cursor: pointer;
+            margin-top: 2px;
+            transition: opacity .15s;
+        }
+        #save:hover { opacity: .9; }
+        #status {
+            text-align: center;
+            font-size: 12px;
+            color: #16a34a;
+            font-weight: 600;
+            margin-top: 8px;
+            min-height: 18px;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>✦ Sheja Asks</h1>
+        <p>AI Settings</p>
+    </header>
+
+    <div id="qa-tabs">
+        <button class="qa-tab active" data-provider="claude">Claude<span class="qa-dot" id="dot-claude"></span></button>
+        <button class="qa-tab" data-provider="openai">ChatGPT<span class="qa-dot" id="dot-openai"></span></button>
+        <button class="qa-tab" data-provider="gemini">Gemini <span class="badge">Free</span><span class="qa-dot" id="dot-gemini"></span></button>
+        <button class="qa-tab" data-provider="mistral">Mistral<span class="qa-dot" id="dot-mistral"></span></button>
+    </div>
+
+    <main>
+        <div class="qa-field">
+            <label id="key-label">API Key</label>
+            <input type="password" id="key" autocomplete="off">
+            <div class="qa-hint" id="key-hint"></div>
+            <div class="qa-model" id="model-label"></div>
+        </div>
+        <button id="save">Use This AI</button>
+        <div id="status"></div>
+    </main>
+
+    <script src="popup.js"></script>
+</body>
+</html>
