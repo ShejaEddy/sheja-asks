@@ -29,7 +29,7 @@ let activeProvider = "claude";
 let keys = {};
 
 document.addEventListener("DOMContentLoaded", () => {
-    chrome.storage.sync.get(
+    chrome.storage.local.get(
         ["provider", "apiKey_claude", "apiKey_openai", "apiKey_gemini", "apiKey_mistral"],
         (settings) => {
             keys = {
@@ -55,7 +55,7 @@ document.addEventListener("DOMContentLoaded", () => {
     document.getElementById("save").addEventListener("click", () => {
         keys[activeProvider] = document.getElementById("key").value.trim();
 
-        chrome.storage.sync.set({
+        chrome.storage.local.set({
             provider:       activeProvider,
             apiKey_claude:  keys.claude,
             apiKey_openai:  keys.openai,
