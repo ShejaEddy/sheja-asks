@@ -29,7 +29,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
                     return;
                 }
                 callWithTimeout(signal =>
-                    call(provider, apiKey, msg.question, msg.answers || [], msg.imageDataUrl || null, signal)
+                    call(provider, apiKey, msg.question, msg.answers || [], msg.imageDataUrl || null, signal, msg.strict)
                 )
                 .then(answer => sendResponse({ answer, provider }))
                 .catch(err   => sendResponse({ error: err.message }));
@@ -62,34 +62,55 @@ function httpError(status) {
     return `HTTP ${status}`;
 }
 
-function buildPrompt(question, answers, hasImage) {
+// Dissect the question type and return a tailored hint so the model understands what's being asked.
+function questionTypeHint(q) {
+    const l = q.toLowerCase();
+    if (l.includes("unscramble") || l.includes("anagram") || l.includes("rearrange"))
+        return "\n- ANAGRAM: rearrange EXACTLY the scrambled letters into one real word — every letter used once, no extras. Count carefully: \"elcyeh\" = e,l,c,y,e,h (6 letters) -> lychee.";
+    if (l.startsWith("fill in") || l.startsWith("complete ") || l.includes("_____") || l.includes("____"))
+        return "\n- FILL-IN: give ONLY the missing word(s) that complete it, nothing else.";
+    if (l.startsWith("calculate") || l.startsWith("solve") || l.includes("how much") || /\bsum\b|\bproduct\b|\bequals\b/.test(l))
+        return "\n- MATH: compute step by step internally; reply with the final number only.";
+    if (l.startsWith("how many") || l.startsWith("how much"))
+        return "\n- NUMERIC: reply with the number only.";
+    if (l.startsWith("what is") || l.startsWith("what are") || l.startsWith("define") || l.startsWith("what does"))
+        return "\n- DEFINITION: reply with the precise term or short fact only.";
+    if (l.startsWith("true or false") || l.includes("true or false"))
+        return "\n- TRUE/FALSE: reply with exactly True or False.";
+    return "";
+}
+
+function buildPrompt(question, answers, hasImage, strict) {
     const imgNote = hasImage
         ? "\n\nA screenshot of the quiz page is attached. Look carefully at any images, flags, logos, maps, or visual content shown. Use what you see to answer the question."
         : "";
 
+    const typeHint = questionTypeHint(question)
+        + (strict && answers.length ? "\n- IMPORTANT: your previous answer was not one of the options. Line 1 MUST be copied character-for-character from the options list — pick the single best one." : "");
+
     if (!answers.length) {
-        return `You are a quiz answer assistant.${imgNote}\n\nQuestion: ${question}\n\nReply with ONLY: [answer] — [one brief reason]\nRules:\n- Answer must be 1-3 words, simplest direct form\n- No articles (a / an / the) unless the quiz expects them\n- No possessives (your / my) — use bare noun\n- Riddle example: "future — It is always ahead of you."\n- Riddle example: "comb — It has teeth but no mouth."`;
+        return `You are a quiz answer assistant.${imgNote}\n\nQuestion: ${question}\n\nRules:${typeHint}\n- The answer is 1-3 words, the simplest direct form\n- No articles (a / an / the) unless the answer is a proper name that includes one\n- No possessives (your / my) — use a bare noun\n- No square brackets, no quotes\n\nFormat your reply as EXACTLY two lines:\nLine 1: the answer ONLY (nothing else on this line)\nLine 2: a reason, 6 words max\n\nExample:\ncherry\nrearranged e,l,c,y,e,h\n\nExample:\nfuture\nalways ahead of you`;
     }
 
-    return `You are a quiz answer assistant. Pick the correct answer from the options.${imgNote}\n\nQuestion: ${question}\nOptions: ${answers.join(", ")}\n\nReply with ONLY: [exact option text] — [one brief reason]\nIMPORTANT: Your answer must be copied word for word from the options listed above.`;
+    return `You are a quiz answer assistant. Pick the correct answer from the options.${imgNote}\n\nQuestion: ${question}\nOptions: ${answers.join(", ")}${typeHint}\n\nFormat your reply as EXACTLY two lines:\nLine 1: the correct option, copied WORD FOR WORD from the options above (nothing else on this line)\nLine 2: a reason, 6 words max\n\nDo not add square brackets, quotes, letters, or numbering to line 1.\n\nExample:\nAsia\ncarrots originated near Afghanistan`;
 }
 
 function base64(dataUrl) {
     return dataUrl.replace(/^data:image\/\w+;base64,/, "");
 }
 
-async function call(provider, apiKey, question, answers, imageDataUrl, signal) {
+async function call(provider, apiKey, question, answers, imageDataUrl, signal, strict) {
     switch (provider) {
-        case "claude":  return callClaude (apiKey, question, answers, imageDataUrl, signal);
-        case "openai":  return callOpenAI (apiKey, question, answers, imageDataUrl, signal);
-        case "gemini":  return callGemini (apiKey, question, answers, imageDataUrl, signal);
-        case "mistral": return callMistral(apiKey, question, answers, imageDataUrl, signal);
+        case "claude":  return callClaude (apiKey, question, answers, imageDataUrl, signal, strict);
+        case "openai":  return callOpenAI (apiKey, question, answers, imageDataUrl, signal, strict);
+        case "gemini":  return callGemini (apiKey, question, answers, imageDataUrl, signal, strict);
+        case "mistral": return callMistral(apiKey, question, answers, imageDataUrl, signal, strict);
         default: throw new Error("Unknown provider: " + provider);
     }
 }
 
-async function callClaude(apiKey, question, answers, imageDataUrl, signal) {
-    const prompt  = buildPrompt(question, answers, !!imageDataUrl);
+async function callClaude(apiKey, question, answers, imageDataUrl, signal, strict) {
+    const prompt  = buildPrompt(question, answers, !!imageDataUrl, strict);
     const content = imageDataUrl ? [
         { type: "image", source: { type: "base64", media_type: "image/jpeg", data: base64(imageDataUrl) } },
         { type: "text", text: prompt }
@@ -103,7 +124,7 @@ async function callClaude(apiKey, question, answers, imageDataUrl, signal) {
             "anthropic-version": "2023-06-01",
             "anthropic-dangerous-direct-browser-access": "true"
         },
-        body: JSON.stringify({ model: MODELS.claude, max_tokens: 256, messages: [{ role: "user", content }] }),
+        body: JSON.stringify({ model: MODELS.claude, max_tokens: 120, messages: [{ role: "user", content }] }),
         signal
     });
     if (!r.ok) throw new Error(httpError(r.status));
@@ -114,8 +135,8 @@ async function callClaude(apiKey, question, answers, imageDataUrl, signal) {
     return text;
 }
 
-async function callOpenAI(apiKey, question, answers, imageDataUrl, signal) {
-    const prompt  = buildPrompt(question, answers, !!imageDataUrl);
+async function callOpenAI(apiKey, question, answers, imageDataUrl, signal, strict) {
+    const prompt  = buildPrompt(question, answers, !!imageDataUrl, strict);
     const content = imageDataUrl ? [
         { type: "image_url", image_url: { url: imageDataUrl, detail: "low" } },
         { type: "text", text: prompt }
@@ -124,7 +145,7 @@ async function callOpenAI(apiKey, question, answers, imageDataUrl, signal) {
     const r = await fetch("https://api.openai.com/v1/chat/completions", {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
-        body: JSON.stringify({ model: MODELS.openai, max_tokens: 256, messages: [{ role: "user", content }] }),
+        body: JSON.stringify({ model: MODELS.openai, max_tokens: 120, messages: [{ role: "user", content }] }),
         signal
     });
     if (!r.ok) throw new Error(httpError(r.status));
@@ -135,8 +156,8 @@ async function callOpenAI(apiKey, question, answers, imageDataUrl, signal) {
     return text;
 }
 
-async function callGemini(apiKey, question, answers, imageDataUrl, signal) {
-    const prompt = buildPrompt(question, answers, !!imageDataUrl);
+async function callGemini(apiKey, question, answers, imageDataUrl, signal, strict) {
+    const prompt = buildPrompt(question, answers, !!imageDataUrl, strict);
     const parts  = imageDataUrl ? [
         { inline_data: { mime_type: "image/jpeg", data: base64(imageDataUrl) } },
         { text: prompt }
@@ -149,7 +170,7 @@ async function callGemini(apiKey, question, answers, imageDataUrl, signal) {
         body: JSON.stringify({
             contents: [{ parts }],
             generationConfig: {
-                maxOutputTokens: 256,
+                maxOutputTokens: 120,
                 thinkingConfig: { thinkingBudget: 0 }  // disable reasoning for speed
             }
         }),
@@ -163,8 +184,8 @@ async function callGemini(apiKey, question, answers, imageDataUrl, signal) {
     return text;
 }
 
-async function callMistral(apiKey, question, answers, imageDataUrl, signal) {
-    const prompt  = buildPrompt(question, answers, !!imageDataUrl);
+async function callMistral(apiKey, question, answers, imageDataUrl, signal, strict) {
+    const prompt  = buildPrompt(question, answers, !!imageDataUrl, strict);
     const model   = imageDataUrl ? "pixtral-12b-2409" : MODELS.mistral;
     const content = imageDataUrl ? [
         { type: "image_url", image_url: { url: imageDataUrl } },
@@ -174,7 +195,7 @@ async function callMistral(apiKey, question, answers, imageDataUrl, signal) {
     const r = await fetch("https://api.mistral.ai/v1/chat/completions", {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
-        body: JSON.stringify({ model, max_tokens: 256, messages: [{ role: "user", content }] }),
+        body: JSON.stringify({ model, max_tokens: 120, messages: [{ role: "user", content }] }),
         signal
     });
     if (!r.ok) throw new Error(httpError(r.status));
