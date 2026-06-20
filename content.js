@@ -353,222 +353,294 @@
     #qa-overlay {
         position: fixed; top: 50%; right: 20px;
         transform: translateY(-50%);
-        width: min(335px, calc(100vw - 24px));
-        background: rgba(18, 18, 33, 0.94);
-        -webkit-backdrop-filter: blur(16px) saturate(1.25);
-        backdrop-filter: blur(16px) saturate(1.25);
-        border: 1px solid rgba(140,124,255,.28); border-radius: 18px;
+        width: min(320px, calc(100vw - 24px));
+        background: rgba(9, 8, 22, 0.97);
+        -webkit-backdrop-filter: blur(24px) saturate(1.4);
+        backdrop-filter: blur(24px) saturate(1.4);
+        border: 1px solid rgba(120,100,255,.22);
+        border-radius: 22px;
         z-index: 2147483647 !important;
         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif !important;
-        font-size: 13px !important; color: #e9e7f7 !important;
-        box-shadow: 0 18px 50px rgba(0,0,0,.55), 0 0 0 1px rgba(140,124,255,.08), inset 0 1px 0 rgba(255,255,255,.05);
-        overflow: hidden; transition: box-shadow .2s, transform .12s;
+        font-size: 13px !important; color: #e8e6f6 !important;
+        box-shadow: 0 24px 60px rgba(0,0,0,.7), 0 0 0 1px rgba(120,100,255,.06),
+                    inset 0 1px 0 rgba(255,255,255,.05);
+        overflow: hidden; transition: box-shadow .2s;
     }
-    #qa-overlay.qa-dragging {
-        box-shadow: 0 26px 70px rgba(0,0,0,.6), 0 0 0 1px rgba(140,124,255,.28);
-    }
+    #qa-overlay.qa-dragging { box-shadow: 0 36px 80px rgba(0,0,0,.75); }
     #qa-overlay * { box-sizing: border-box !important; line-height: normal !important; }
 
+    /* ─ Header ─ */
     #qa-header {
-        display: flex; align-items: center; padding: 12px 13px;
-        background: linear-gradient(135deg, #6d5cff, #9b78f0 55%, #c08af0);
+        display: flex; align-items: center;
+        padding: 10px 11px 10px 14px;
+        background: linear-gradient(135deg, #4a38cc 0%, #7553e0 50%, #a46de6 100%);
+        border-bottom: 1px solid rgba(0,0,0,.25);
         cursor: grab; user-select: none; gap: 8px;
     }
     #qa-header:active { cursor: grabbing; }
     #qa-title {
-        font-weight: 800 !important; font-size: 14px !important;
-        color: #fff !important; flex: 1; white-space: nowrap;
-        display: flex; align-items: center; gap: 7px; letter-spacing: .2px;
-        text-shadow: 0 1px 2px rgba(0,0,0,.18);
+        font-weight: 800 !important; font-size: 13.5px !important;
+        color: #fff !important; white-space: nowrap;
+        display: flex; align-items: center; gap: 6px;
+        text-shadow: 0 1px 4px rgba(0,0,0,.3); flex-shrink: 0;
+        letter-spacing: -.1px;
     }
     #qa-q-count {
-        font-size: 10px !important; font-weight: 800 !important;
-        background: rgba(0,0,0,.24); color: #fff !important;
-        border-radius: 20px; padding: 2px 8px; letter-spacing: .3px;
+        font-size: 9px !important; font-weight: 700 !important;
+        background: rgba(0,0,0,.28); color: rgba(255,255,255,.75) !important;
+        border-radius: 8px; padding: 1px 5px; letter-spacing: .2px;
     }
-    #qa-controls { display: flex; gap: 5px; align-items: center; flex-shrink: 0; }
-    #qa-toggle {
-        background: rgba(255,255,255,.16); border: 1px solid rgba(255,255,255,.32);
-        color: #fff !important; font-size: 10px !important; font-weight: 700 !important;
-        padding: 4px 9px; border-radius: 20px; cursor: pointer;
-        letter-spacing: .4px; white-space: nowrap; transition: background .15s;
+    #qa-status {
+        flex: 1; text-align: center;
+        font-size: 9px !important; font-weight: 700 !important;
+        letter-spacing: .6px; text-transform: uppercase;
+        color: rgba(255,255,255,.38) !important;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
-    #qa-toggle:hover, #qa-toggle.qa-on { background: rgba(255,255,255,.34); }
+    #qa-status.qa-s-busy { color: #cfc5ff !important; animation: qa-blink 1.1s ease-in-out infinite; }
+    #qa-status.qa-s-ok   { color: #7dffc0 !important; }
+    #qa-status.qa-s-err  { color: #ff9999 !important; }
+    @keyframes qa-blink { 0%,100%{opacity:.45} 50%{opacity:1} }
+
+    #qa-controls { display: flex; gap: 4px; align-items: center; flex-shrink: 0; }
     .qa-icon-btn {
-        background: rgba(255,255,255,.14); border: none;
-        color: #fff !important; width: 26px; height: 26px; border-radius: 50%;
-        cursor: pointer; font-size: 14px !important;
+        background: rgba(255,255,255,.1); border: 1px solid rgba(255,255,255,.14);
+        color: rgba(255,255,255,.85) !important; width: 25px; height: 25px; border-radius: 8px;
+        cursor: pointer; font-size: 11px !important; font-weight: 700 !important;
         display: flex; align-items: center; justify-content: center;
-        transition: background .15s, transform .1s; flex-shrink: 0; padding: 0;
+        transition: background .15s, border-color .15s; flex-shrink: 0; padding: 0; letter-spacing: 0;
     }
-    .qa-icon-btn:hover { background: rgba(255,255,255,.3); transform: translateY(-1px); }
+    .qa-icon-btn:hover { background: rgba(255,255,255,.24); border-color: rgba(255,255,255,.28); }
+    .qa-icon-btn.qa-on { background: rgba(255,255,255,.28); border-color: rgba(255,255,255,.4); }
 
-    #qa-statusbar {
-        display: flex; align-items: center; padding: 7px 14px;
-        background: rgba(255,255,255,.03);
-        border-bottom: 1px solid rgba(140,124,255,.12);
-    }
-    .qa-status {
-        display: inline-flex; align-items: center; gap: 7px;
-        font-size: 11px !important; font-weight: 600 !important;
-        color: #9b97c4 !important; letter-spacing: .2px;
-    }
-    .qa-status::before {
-        content: ""; width: 7px; height: 7px; border-radius: 50%;
-        background: #6b6890; flex-shrink: 0;
-    }
-    .qa-status--busy { color: #c9bcff !important; }
-    .qa-status--busy::before { background: #a78bfa; animation: qa-blink 1s ease-in-out infinite; }
-    .qa-status--ok { color: #5ef0a0 !important; }
-    .qa-status--ok::before { background: #3ddc84; box-shadow: 0 0 8px rgba(61,220,132,.6); }
-    .qa-status--err { color: #ff8585 !important; }
-    .qa-status--err::before { background: #ff5c5c; }
-    @keyframes qa-blink { 0%,100%{opacity:.35} 50%{opacity:1} }
-
+    /* ─ Content ─ */
     #qa-content {
-        max-height: calc(82vh - 96px); overflow-y: auto;
-        padding: 11px; display: flex; flex-direction: column; gap: 9px;
+        max-height: calc(88vh - 50px); overflow-y: auto;
+        padding: 10px 10px 8px; display: flex; flex-direction: column; gap: 7px;
     }
-    #qa-content::-webkit-scrollbar { width: 5px; }
-    #qa-content::-webkit-scrollbar-thumb { background: rgba(140,124,255,.4); border-radius: 5px; }
+    #qa-content::-webkit-scrollbar { width: 3px; }
+    #qa-content::-webkit-scrollbar-thumb { background: rgba(120,100,255,.28); border-radius: 3px; }
 
     .qa-section {
-        background: rgba(255,255,255,.035); border-radius: 13px;
-        padding: 11px 13px; border: 1px solid rgba(140,124,255,.14);
+        background: rgba(255,255,255,.028); border-radius: 13px;
+        padding: 9px 12px; border: 1px solid rgba(120,100,255,.11);
     }
     .qa-hidden { display: none !important; }
     .qa-label {
-        font-size: 9px !important; font-weight: 800 !important;
-        letter-spacing: 1.5px; color: #8b84c0 !important;
-        margin-bottom: 8px; text-transform: uppercase;
+        font-size: 8.5px !important; font-weight: 800 !important;
+        letter-spacing: 1.5px; color: #625e9a !important;
+        margin-bottom: 7px; text-transform: uppercase;
         display: flex; align-items: center; justify-content: space-between;
     }
     .qa-provider-badge {
-        font-size: 9px !important; font-weight: 700 !important;
-        letter-spacing: .3px; background: rgba(140,124,255,.16); color: #c9bcff !important;
-        border: 1px solid rgba(140,124,255,.3); border-radius: 6px; padding: 2px 7px;
+        font-size: 8.5px !important; font-weight: 700 !important;
+        background: rgba(120,100,255,.12); color: #b0a8ff !important;
+        border: 1px solid rgba(120,100,255,.2); border-radius: 5px; padding: 1px 6px;
+        letter-spacing: .3px;
     }
 
     #qa-question {
-        line-height: 1.6 !important; color: #f0eefb !important;
-        font-size: 14px !important; font-weight: 600 !important;
+        line-height: 1.65 !important; color: #eae6fb !important;
+        font-size: 13px !important; font-weight: 500 !important;
     }
-    #qa-timestamp { font-size: 10px !important; color: #7c78a8 !important; font-style: italic; }
+    #qa-timestamp { font-size: 9px !important; color: #565080 !important; font-style: italic; }
     #qa-options {
         list-style: none !important; margin: 0 !important; padding: 0 !important;
-        display: flex; flex-direction: column; gap: 5px;
+        display: flex; flex-direction: column; gap: 4px;
     }
     #qa-options li {
-        background: rgba(140,124,255,.1); border: 1px solid rgba(140,124,255,.14);
-        border-radius: 9px; padding: 7px 11px;
-        color: #d8d4f0 !important; font-size: 13px !important; font-weight: 500 !important;
+        background: rgba(120,100,255,.06); border: 1px solid rgba(120,100,255,.1);
+        border-radius: 8px; padding: 6px 10px;
+        color: #c4c0e6 !important; font-size: 12px !important; font-weight: 500 !important;
     }
-    #qa-options li::before { content: "→ "; color: #a78bfa !important; font-weight: 700 !important; }
+    #qa-options li::before { content: "› "; color: #8870e8 !important; font-weight: 700 !important; }
     #qa-options li.qa-none {
-        color: #6b6890 !important; font-style: italic; font-size: 12px !important;
+        color: #4e4a78 !important; font-style: italic; font-size: 11.5px !important;
         background: transparent !important; border: none !important; padding: 2px 0 !important;
     }
     #qa-options li.qa-none::before { content: none !important; }
 
+    /* ─ Answer card ─ */
     .qa-section--answer {
-        background: linear-gradient(160deg, rgba(61,220,132,.1), rgba(140,124,255,.05));
-        border: 1px solid rgba(61,220,132,.35);
-        transition: border-color .3s, box-shadow .3s;
+        background: rgba(255,255,255,.025);
+        border: 1px solid rgba(120,100,255,.14);
+        transition: border-color .4s, background .4s, box-shadow .4s;
+        padding-bottom: 10px;
     }
-    .qa-section--answer .qa-label { color: #5ef0a0 !important; }
-    .qa-section--answer.qa-pulse { animation: qa-pulse-border .7s ease; }
-    @keyframes qa-pulse-border {
-        0%,100% { border-color: rgba(61,220,132,.35); box-shadow: none; }
-        50%      { border-color: rgba(61,220,132,.9); box-shadow: 0 0 0 4px rgba(61,220,132,.14); }
+    .qa-section--answer.qa-answered {
+        background: rgba(45,190,115,.045);
+        border-color: rgba(50,205,125,.26);
+        box-shadow: inset 0 0 0 1px rgba(50,205,125,.06);
+    }
+    .qa-section--answer .qa-label { color: #706aac !important; }
+    .qa-section--answer.qa-answered .qa-label { color: #4ad890 !important; }
+    .qa-section--answer.qa-pulse { animation: qa-pulse-in .5s ease; }
+    @keyframes qa-pulse-in {
+        0%   { box-shadow: inset 0 0 0 1px rgba(50,205,125,.06); }
+        45%  { box-shadow: inset 0 0 0 1px rgba(50,205,125,.06), 0 0 0 4px rgba(50,205,125,.1); }
+        100% { box-shadow: inset 0 0 0 1px rgba(50,205,125,.06); }
     }
 
     #qa-ai {
-        min-height: 28px; display: flex; flex-direction: column; gap: 9px;
-        transition: opacity .18s ease, transform .18s ease;
+        min-height: 26px; display: flex; flex-direction: column; gap: 8px;
+        transition: opacity .16s ease, transform .16s ease;
     }
     .qa-idle {
-        color: #6b6890 !important; font-style: italic; font-size: 13px !important;
-        animation: qa-breathe 3s ease-in-out infinite;
+        color: #46426a !important; font-style: italic; font-size: 12px !important;
+        padding: 4px 0; animation: qa-breathe 3s ease-in-out infinite;
     }
-    @keyframes qa-breathe { 0%,100%{opacity:.4} 50%{opacity:1} }
+    @keyframes qa-breathe { 0%,100%{opacity:.28} 50%{opacity:.7} }
 
     .qa-loading {
-        display: flex; align-items: center; gap: 9px;
-        color: #c9bcff !important; font-size: 13px !important; font-weight: 500 !important;
+        display: flex; align-items: center; gap: 9px; padding: 4px 0;
+        color: #a098e0 !important; font-size: 12px !important; font-weight: 500 !important;
     }
     .qa-dots { display: flex; gap: 4px; align-items: center; flex-shrink: 0; }
     .qa-dots span {
-        width: 6px; height: 6px; border-radius: 50%; background: #a78bfa;
-        animation: qa-bounce .9s ease-in-out infinite;
+        width: 5px; height: 5px; border-radius: 50%; background: #8868e0;
+        animation: qa-bounce .85s ease-in-out infinite;
     }
-    .qa-dots span:nth-child(2) { animation-delay: .18s; }
-    .qa-dots span:nth-child(3) { animation-delay: .36s; }
+    .qa-dots span:nth-child(2) { animation-delay: .17s; }
+    .qa-dots span:nth-child(3) { animation-delay: .34s; }
     @keyframes qa-bounce {
-        0%,60%,100% { transform: translateY(0); opacity: .5; }
-        30%          { transform: translateY(-6px); opacity: 1; }
+        0%,60%,100% { transform: translateY(0); opacity: .38; }
+        30%          { transform: translateY(-5px); opacity: 1; }
     }
 
     .qa-answer-wrap {
-        display: flex; flex-direction: column; gap: 9px;
-        animation: qa-appear .35s cubic-bezier(.34,1.56,.64,1);
+        display: flex; flex-direction: column; gap: 7px;
+        animation: qa-appear .28s cubic-bezier(.34,1.56,.64,1);
     }
     @keyframes qa-appear {
-        from { opacity: 0; transform: translateY(8px) scale(.97); }
+        from { opacity: 0; transform: translateY(6px) scale(.97); }
         to   { opacity: 1; transform: translateY(0) scale(1); }
     }
-    .qa-answer-row { display: flex; align-items: center; gap: 10px; }
+    .qa-answer-row { display: flex; align-items: center; gap: 9px; }
     .qa-badge {
         display: inline-flex; align-items: center; justify-content: center;
-        min-width: 38px; height: 38px; padding: 0 7px; flex-shrink: 0;
-        background: linear-gradient(135deg, #6d5cff, #b08af0);
-        color: #fff !important; font-size: 20px !important; font-weight: 900 !important;
-        border-radius: 10px; box-shadow: 0 4px 12px rgba(109,92,255,.4);
+        min-width: 36px; height: 36px; padding: 0 6px; flex-shrink: 0;
+        background: linear-gradient(135deg, #4a38cc, #8860e8);
+        color: #fff !important; font-size: 18px !important; font-weight: 900 !important;
+        border-radius: 10px; box-shadow: 0 4px 12px rgba(74,56,204,.38);
     }
     .qa-answer-text {
-        color: #5ef0a0 !important; font-weight: 800 !important;
-        font-size: 19px !important; line-height: 1.25 !important; cursor: pointer;
-        text-shadow: 0 0 18px rgba(61,220,132,.25);
+        color: #52ecaa !important; font-weight: 800 !important;
+        font-size: 19px !important; line-height: 1.2 !important; cursor: pointer;
+        letter-spacing: -.2px;
     }
-    .qa-answer-text:hover { text-decoration: underline; }
-    .qa-answer-text--sm { font-size: 15px !important; }
-    .qa-answer-text--guess { color: #ffd266 !important; text-shadow: 0 0 18px rgba(255,180,60,.2); }
+    .qa-answer-text:hover { color: #6fffc0 !important; text-decoration: underline; }
+    .qa-answer-text--sm { font-size: 14.5px !important; letter-spacing: 0; }
+    .qa-answer-text--guess { color: #ffd060 !important; }
+    .qa-answer-text--guess:hover { color: #ffe080 !important; }
     .qa-answer-text.qa-filled {
-        opacity: .4 !important; text-decoration: line-through !important; cursor: default !important;
+        opacity: .3 !important; text-decoration: line-through !important; cursor: default !important;
     }
     .qa-guess-note {
-        font-size: 10.5px !important; color: #ffd266 !important; font-weight: 600 !important;
-        background: rgba(255,180,60,.1); border: 1px solid rgba(255,180,60,.25);
-        border-radius: 7px; padding: 4px 9px;
+        font-size: 10px !important; color: #ffc040 !important; font-weight: 600 !important;
+        background: rgba(255,170,40,.07); border: 1px solid rgba(255,170,40,.16);
+        border-radius: 6px; padding: 3px 9px;
     }
     .qa-reason {
-        color: #9b97c4 !important; font-size: 11.5px !important;
-        font-style: italic; line-height: 1.5 !important;
+        color: #635f92 !important; font-size: 10.5px !important;
+        font-style: italic; line-height: 1.55 !important;
     }
     .qa-hint {
-        font-size: 11px !important; color: #5ef0a0 !important; font-weight: 600 !important;
-        background: rgba(61,220,132,.1); border: 1px solid rgba(61,220,132,.2);
-        border-radius: 7px; padding: 4px 9px;
+        font-size: 10.5px !important; color: #42d898 !important; font-weight: 600 !important;
+        background: rgba(50,205,125,.06); border: 1px solid rgba(50,205,125,.14);
+        border-radius: 6px; padding: 3px 9px;
     }
     .qa-visual-pending {
-        font-size: 11px !important; color: #c9bcff !important;
+        font-size: 11px !important; color: #a098e0 !important;
         font-style: italic; animation: qa-breathe 2s ease-in-out infinite;
     }
-    .qa-error { color: #ff8585 !important; font-size: 13px !important; font-weight: 500 !important; }
+    .qa-error { color: #ff7a7a !important; font-size: 12px !important; font-weight: 500 !important; }
 
-    .qa-btn-row { display: flex; gap: 6px; margin-top: 2px; }
+    /* ─ Footer ─ */
+    #qa-footer { display: flex; gap: 6px; align-items: center; }
     .qa-btn {
         display: inline-flex; align-items: center; justify-content: center;
-        padding: 7px 14px; border-radius: 9px; flex: 1;
-        font-size: 12px !important; font-weight: 700 !important;
+        padding: 7px 11px; border-radius: 9px;
+        font-size: 11.5px !important; font-weight: 700 !important;
         cursor: pointer; transition: background .15s, transform .1s, border-color .15s;
-        border: none; line-height: 1 !important;
+        border: none; line-height: 1 !important; letter-spacing: .15px;
     }
     .qa-btn:hover:not(:disabled) { transform: translateY(-1px); }
-    .qa-btn:disabled { opacity: .55; cursor: default; transform: none; }
+    .qa-btn:active:not(:disabled) { transform: translateY(0); }
+    .qa-btn:disabled { opacity: .4; cursor: default; transform: none; }
+
     .qa-btn--scan {
-        background: rgba(140,124,255,.16); color: #c9bcff !important; border: 1px solid rgba(140,124,255,.3);
+        flex: 1;
+        background: rgba(120,100,255,.1); color: #a098e0 !important;
+        border: 1px solid rgba(120,100,255,.2);
     }
-    .qa-btn--scan:hover:not(:disabled) { background: rgba(140,124,255,.28); border-color: rgba(140,124,255,.5); }
+    .qa-btn--scan:hover:not(:disabled) {
+        background: rgba(120,100,255,.2); color: #c0b8ff !important;
+        border-color: rgba(120,100,255,.36);
+    }
+
+    /* nudge toggle — relative so the active-hint dot can sit in corner */
+    .qa-btn--nudge {
+        position: relative;
+        background: rgba(255,255,255,.04); color: #5e5a8a !important;
+        border: 1px solid rgba(255,255,255,.07); padding: 7px 10px; font-size: 13px !important;
+    }
+    .qa-btn--nudge:hover:not(:disabled) { background: rgba(255,255,255,.1); color: #9a96cc !important; }
+    .qa-btn--nudge.qa-active {
+        background: rgba(120,100,255,.16); color: #beb6ff !important;
+        border-color: rgba(120,100,255,.32);
+    }
+    /* green dot when a hint is saved */
+    .qa-btn--nudge.qa-nudge-has-hint::after {
+        content: ""; position: absolute; top: 4px; right: 4px;
+        width: 6px; height: 6px; border-radius: 50%;
+        background: #42d898; box-shadow: 0 0 5px rgba(66,216,152,.6);
+    }
+
+    /* ─ Nudge panel ─ */
+    #qa-nudge-panel {
+        display: flex; flex-direction: column; gap: 5px;
+        background: rgba(255,255,255,.022); border: 1px solid rgba(120,100,255,.14);
+        border-radius: 13px; padding: 9px 10px;
+        animation: qa-appear .2s ease;
+    }
+    #qa-nudge-input {
+        width: 100% !important;
+        background: rgba(120,100,255,.06) !important;
+        border: 1px solid rgba(120,100,255,.18) !important;
+        border-radius: 9px !important;
+        color: #ccc8ee !important; font-size: 12px !important;
+        font-family: inherit !important; padding: 8px 10px !important;
+        resize: none !important; line-height: 1.5 !important;
+        outline: none !important; transition: border-color .15s, background .15s;
+    }
+    #qa-nudge-input:focus {
+        border-color: rgba(120,100,255,.42) !important;
+        background: rgba(120,100,255,.1) !important;
+    }
+    #qa-nudge-input::placeholder { color: #38345a !important; font-style: italic; }
+    .qa-nudge-foot {
+        display: flex; align-items: center; gap: 5px;
+    }
+    .qa-nudge-meta {
+        flex: 1; font-size: 8.5px !important; color: #3c395e !important; font-style: italic;
+    }
+    .qa-btn--nudge-clear {
+        background: rgba(255,255,255,.04); color: #5a5680 !important;
+        border: 1px solid rgba(255,255,255,.07);
+        padding: 4px 9px; border-radius: 7px; flex-shrink: 0;
+        font-size: 10.5px !important; font-weight: 600 !important;
+        cursor: pointer; transition: background .15s, color .15s;
+    }
+    .qa-btn--nudge-clear:hover { background: rgba(255,80,80,.1); color: #ff8080 !important; border-color: rgba(255,80,80,.2); }
+    .qa-btn--nudge-submit {
+        background: linear-gradient(135deg, #4a38cc, #7553e0);
+        color: #fff !important; border: none;
+        padding: 4px 11px; border-radius: 7px; flex-shrink: 0;
+        font-size: 10.5px !important; font-weight: 700 !important;
+        cursor: pointer; transition: opacity .15s; letter-spacing: .2px;
+        box-shadow: 0 2px 8px rgba(74,56,204,.35);
+    }
+    .qa-btn--nudge-submit:hover { opacity: .84; }
     `;
 
     // ── Overlay HTML ───────────────────────────────────────────────────────────
@@ -577,14 +649,14 @@
     overlay.innerHTML = `
         <div id="qa-header">
             <span id="qa-title">✶ Sheja Asks<span id="qa-q-count" style="display:none"></span></span>
+            <span id="qa-status">Idle</span>
             <div id="qa-controls">
-                <button id="qa-toggle" title="Toggle question &amp; options">Show Q</button>
+                <button class="qa-icon-btn" id="qa-toggle" title="Show question &amp; options">Q</button>
                 <button class="qa-icon-btn" id="qa-pause" title="Pause auto-detection">⏸</button>
                 <button class="qa-icon-btn" id="qa-min" title="Minimize">─</button>
                 <button class="qa-icon-btn" id="qa-close" title="Close">×</button>
             </div>
         </div>
-        <div id="qa-statusbar"><span id="qa-status" class="qa-status">Idle</span></div>
         <div id="qa-content">
             <div class="qa-section qa-hidden" id="qa-question-section">
                 <div class="qa-label">
@@ -603,6 +675,18 @@
                     <span class="qa-provider-badge" id="qa-provider-badge"></span>
                 </div>
                 <div id="qa-ai"><span class="qa-idle">Waiting for a question...</span></div>
+            </div>
+            <div id="qa-footer">
+                <button id="qa-scan-main" class="qa-btn qa-btn--scan">↺ Rescan</button>
+                <button id="qa-nudge-toggle" class="qa-btn qa-btn--nudge" title="Steer the AI with a context hint">💬</button>
+            </div>
+            <div id="qa-nudge-panel" class="qa-hidden">
+                <textarea id="qa-nudge-input" rows="2" placeholder="Steer the AI — e.g. &quot;This quiz is about 20th century European history&quot;"></textarea>
+                <div class="qa-nudge-foot">
+                    <span class="qa-nudge-meta">Sent with every call · Enter to submit</span>
+                    <button id="qa-nudge-clear" class="qa-btn--nudge-clear">Clear</button>
+                    <button id="qa-nudge-submit" class="qa-btn--nudge-submit">Submit ↵</button>
+                </div>
             </div>
         </div>
     `;
@@ -636,20 +720,22 @@
 
     // Pipeline status pill: detecting → waiting → asking → answered → error.
     const _STATUS = {
-        detecting: { label: "Detecting…",          cls: "qa-status--busy" },
-        waiting:   { label: "Waiting for options…", cls: "qa-status--busy" },
-        asking:    { label: "Asking AI…",           cls: "qa-status--busy" },
-        answered:  { label: "Answered",             cls: "qa-status--ok" },
-        error:     { label: "Error",                cls: "qa-status--err" },
-        paused:    { label: "Paused",               cls: "" },
-        idle:      { label: "Idle",                 cls: "" }
+        detecting: { label: "Detecting…",  cls: "qa-s-busy" },
+        waiting:   { label: "Waiting…",    cls: "qa-s-busy" },
+        asking:    { label: "Asking AI…",  cls: "qa-s-busy" },
+        answered:  { label: "Answered ✓",  cls: "qa-s-ok"   },
+        error:     { label: "Error",       cls: "qa-s-err"  },
+        paused:    { label: "Paused",      cls: ""          },
+        idle:      { label: "Idle",        cls: ""          }
     };
     function setStatus(key) {
         const el = document.getElementById("qa-status");
         if (!el) return;
         const s = _STATUS[key] || _STATUS.idle;
         el.textContent = s.label;
-        el.className = "qa-status " + s.cls;
+        el.className = s.cls || "";
+        const ansCard = document.querySelector(".qa-section--answer");
+        if (ansCard) ansCard.classList.toggle("qa-answered", key === "answered");
     }
 
     // Fades #qa-ai out, rebuilds content via buildFn, fades back in.
@@ -697,15 +783,6 @@
             err.className = "qa-error";
             err.textContent = "⚠ " + msg;
             wrap.appendChild(err);
-
-            const row = document.createElement("div");
-            row.className = "qa-btn-row";
-            const btn = document.createElement("button");
-            btn.className = "qa-btn qa-btn--scan";
-            btn.textContent = "↺ Scan";
-            btn.addEventListener("click", () => scanScreen());
-            row.appendChild(btn);
-            wrap.appendChild(row);
 
             el.appendChild(wrap);
         });
@@ -841,24 +918,6 @@
                 pend.textContent = "📷 Checking with screenshot...";
                 wrap.appendChild(pend);
             }
-
-            const btnRow = document.createElement("div");
-            btnRow.className = "qa-btn-row";
-            const scanBtn = document.createElement("button");
-            scanBtn.className = "qa-btn qa-btn--scan";
-            scanBtn.textContent = "↺ Scan";
-            scanBtn.addEventListener("click", () => {
-                // Prefer fresh DOM state at click time — quiz may have advanced since render
-                const scannedQ = scanForCurrentQuestion();
-                const freshQ = scannedQ || overlayQuestion;
-                const freshA = extractAnswers();
-                const sameKnownQuestion = scannedQ && scannedQ === overlayQuestion;
-                const sameVisualContext = visualFingerprint() === overlayVisualKey;
-                const scanAnswers = freshA.length >= 2 ? freshA : (sameKnownQuestion && sameVisualContext ? overlayAnswers : []);
-                scanScreen(freshQ, scanAnswers);
-            });
-            btnRow.appendChild(scanBtn);
-            wrap.appendChild(btnRow);
 
             // Auto-fill only on manual rescan, not on auto-detected questions
             if (autoFill && !visualPending) setTimeout(doFill, AUTOFILL_MS);
@@ -1030,9 +1089,12 @@
         };
 
         const send = (image) => {
+            const nudgeEl = document.getElementById("qa-nudge-input");
+            const nudge   = (nudgeEl?.value || "").trim();
             const msg = { action: "askAI", question: q, answers: ans };
             if (strict) msg.strict = true;
             if (image)  msg.imageDataUrl = image;
+            if (nudge)  msg.nudge = nudge;
             runtimeSend(msg, resp => handle(resp, image));
         };
 
@@ -1083,7 +1145,7 @@
         const btn = document.getElementById("qa-toggle");
         qs?.classList.toggle("qa-hidden", !questionVisible);
         os?.classList.toggle("qa-hidden", !questionVisible);
-        if (btn) { btn.textContent = questionVisible ? "Hide Q" : "Show Q"; btn.classList.toggle("qa-on", questionVisible); }
+        if (btn) btn.classList.toggle("qa-on", questionVisible);
     }
 
     function mountOverlay() {
@@ -1143,10 +1205,93 @@
             overlay.style.top  = Math.max(0, Math.min(e.clientY - dragY, window.innerHeight - overlay.offsetHeight)) + "px";
         });
         document.addEventListener("mouseup", () => { if (isDragging) { isDragging = false; savePosition(); } });
+
+        // Persistent rescan button — uses fresh DOM state at click time
+        overlay.querySelector("#qa-scan-main").addEventListener("click", () => {
+            const scannedQ = scanForCurrentQuestion();
+            const freshQ   = scannedQ || overlayQuestion;
+            const freshA   = extractAnswers();
+            const sameQ    = scannedQ && scannedQ === overlayQuestion;
+            const sameVis  = visualFingerprint() === overlayVisualKey;
+            const scanAns  = freshA.length >= 2 ? freshA : (sameQ && sameVis ? overlayAnswers : []);
+            scanScreen(freshQ, scanAns);
+        });
+
+        // Nudge panel toggle (closed by default)
+        overlay.querySelector("#qa-nudge-toggle").addEventListener("click", () => {
+            const panel = document.getElementById("qa-nudge-panel");
+            const btn   = document.getElementById("qa-nudge-toggle");
+            const open  = panel.classList.toggle("qa-hidden") === false;
+            btn.classList.toggle("qa-active", open);
+            if (open) document.getElementById("qa-nudge-input")?.focus();
+        });
+
+        // Save nudge to storage on change (debounced), update indicator
+        overlay.querySelector("#qa-nudge-input").addEventListener("input", () => {
+            updateNudgeIndicator();
+            clearTimeout(overlay._nudgeSave);
+            overlay._nudgeSave = setTimeout(() => {
+                chrome.storage.local.set({ nudgeHint: (document.getElementById("qa-nudge-input")?.value || "").trim() });
+            }, 600);
+        });
+
+        // Enter without Shift submits; Submit button also submits
+        overlay.querySelector("#qa-nudge-input").addEventListener("keydown", e => {
+            if (e.key !== "Enter" || e.shiftKey) return;
+            e.preventDefault();
+            submitNudge();
+        });
+        overlay.querySelector("#qa-nudge-submit").addEventListener("click", submitNudge);
+
+        // Clear button — wipes hint, keeps panel open
+        overlay.querySelector("#qa-nudge-clear").addEventListener("click", () => {
+            const input = document.getElementById("qa-nudge-input");
+            if (input) input.value = "";
+            clearTimeout(overlay._nudgeSave);
+            chrome.storage.local.set({ nudgeHint: "" });
+            updateNudgeIndicator();
+            input?.focus();
+        });
+
+        // Restore saved nudge hint and update indicator
+        chrome.storage.local.get("nudgeHint", data => {
+            const input = document.getElementById("qa-nudge-input");
+            if (input && data.nudgeHint) { input.value = data.nudgeHint; updateNudgeIndicator(); }
+        });
+    }
+
+    function closeNudgePanel() {
+        const panel = document.getElementById("qa-nudge-panel");
+        const btn   = document.getElementById("qa-nudge-toggle");
+        if (panel) panel.classList.add("qa-hidden");
+        if (btn)   btn.classList.remove("qa-active");
+    }
+
+    function updateNudgeIndicator() {
+        const btn   = document.getElementById("qa-nudge-toggle");
+        const input = document.getElementById("qa-nudge-input");
+        if (btn && input) btn.classList.toggle("qa-nudge-has-hint", !!input.value.trim());
+    }
+
+    // Save nudge, close panel, and immediately re-ask the current question with the hint.
+    function submitNudge() {
+        const input = document.getElementById("qa-nudge-input");
+        clearTimeout(overlay._nudgeSave);
+        if (input) chrome.storage.local.set({ nudgeHint: input.value.trim() });
+        updateNudgeIndicator();
+        closeNudgePanel();
+        if (!overlayQuestion) return;
+        cancelPendingGate();
+        const freshA = extractAnswers();
+        const ans = freshA.length >= 2 ? freshA : overlayAnswers;
+        showLoading("Re-asking with your hint…");
+        setStatus("asking");
+        askAI(overlayQuestion, ans, null, false);
     }
 
     function updateOverlay() {
         mountOverlay();
+        closeNudgePanel();
 
         const qEl  = document.getElementById("qa-question");
         const tsEl = document.getElementById("qa-timestamp");

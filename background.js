@@ -29,7 +29,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
                     return;
                 }
                 callWithTimeout(signal =>
-                    call(provider, apiKey, msg.question, msg.answers || [], msg.imageDataUrl || null, signal, msg.strict)
+                    call(provider, apiKey, msg.question, msg.answers || [], msg.imageDataUrl || null, signal, msg.strict, msg.nudge || "")
                 )
                 .then(answer => sendResponse({ answer, provider }))
                 .catch(err   => sendResponse({ error: err.message }));
@@ -80,37 +80,38 @@ function questionTypeHint(q) {
     return "";
 }
 
-function buildPrompt(question, answers, hasImage, strict) {
-    const imgNote = hasImage
+function buildPrompt(question, answers, hasImage, strict, nudge) {
+    const imgNote   = hasImage
         ? "\n\nA screenshot of the quiz page is attached. Look carefully at any images, flags, logos, maps, or visual content shown. Use what you see to answer the question."
         : "";
+    const nudgeNote = nudge ? `\n\nAdditional context: ${nudge}` : "";
 
     const typeHint = questionTypeHint(question)
         + (strict && answers.length ? "\n- IMPORTANT: your previous answer was not one of the options. Line 1 MUST be copied character-for-character from the options list — pick the single best one." : "");
 
     if (!answers.length) {
-        return `You are a quiz answer assistant.${imgNote}\n\nQuestion: ${question}\n\nRules:${typeHint}\n- The answer is 1-3 words, the simplest direct form\n- No articles (a / an / the) unless the answer is a proper name that includes one\n- No possessives (your / my) — use a bare noun\n- No square brackets, no quotes\n\nFormat your reply as EXACTLY two lines:\nLine 1: the answer ONLY (nothing else on this line)\nLine 2: a reason, 6 words max\n\nExample:\ncherry\nrearranged e,l,c,y,e,h\n\nExample:\nfuture\nalways ahead of you`;
+        return `You are a quiz answer assistant.${imgNote}${nudgeNote}\n\nQuestion: ${question}\n\nRules:${typeHint}\n- The answer is 1-3 words, the simplest direct form\n- No articles (a / an / the) unless the answer is a proper name that includes one\n- No possessives (your / my) — use a bare noun\n- No square brackets, no quotes\n\nFormat your reply as EXACTLY two lines:\nLine 1: the answer ONLY (nothing else on this line)\nLine 2: a reason, 6 words max\n\nExample:\ncherry\nrearranged e,l,c,y,e,h\n\nExample:\nfuture\nalways ahead of you`;
     }
 
-    return `You are a quiz answer assistant. Pick the correct answer from the options.${imgNote}\n\nQuestion: ${question}\nOptions: ${answers.join(", ")}${typeHint}\n\nFormat your reply as EXACTLY two lines:\nLine 1: the correct option, copied WORD FOR WORD from the options above (nothing else on this line)\nLine 2: a reason, 6 words max\n\nDo not add square brackets, quotes, letters, or numbering to line 1.\n\nExample:\nAsia\ncarrots originated near Afghanistan`;
+    return `You are a quiz answer assistant. Pick the correct answer from the options.${imgNote}${nudgeNote}\n\nQuestion: ${question}\nOptions: ${answers.join(", ")}${typeHint}\n\nFormat your reply as EXACTLY two lines:\nLine 1: the correct option, copied WORD FOR WORD from the options above (nothing else on this line)\nLine 2: a reason, 6 words max\n\nDo not add square brackets, quotes, letters, or numbering to line 1.\n\nExample:\nAsia\ncarrots originated near Afghanistan`;
 }
 
 function base64(dataUrl) {
     return dataUrl.replace(/^data:image\/\w+;base64,/, "");
 }
 
-async function call(provider, apiKey, question, answers, imageDataUrl, signal, strict) {
+async function call(provider, apiKey, question, answers, imageDataUrl, signal, strict, nudge) {
     switch (provider) {
-        case "claude":  return callClaude (apiKey, question, answers, imageDataUrl, signal, strict);
-        case "openai":  return callOpenAI (apiKey, question, answers, imageDataUrl, signal, strict);
-        case "gemini":  return callGemini (apiKey, question, answers, imageDataUrl, signal, strict);
-        case "mistral": return callMistral(apiKey, question, answers, imageDataUrl, signal, strict);
+        case "claude":  return callClaude (apiKey, question, answers, imageDataUrl, signal, strict, nudge);
+        case "openai":  return callOpenAI (apiKey, question, answers, imageDataUrl, signal, strict, nudge);
+        case "gemini":  return callGemini (apiKey, question, answers, imageDataUrl, signal, strict, nudge);
+        case "mistral": return callMistral(apiKey, question, answers, imageDataUrl, signal, strict, nudge);
         default: throw new Error("Unknown provider: " + provider);
     }
 }
 
-async function callClaude(apiKey, question, answers, imageDataUrl, signal, strict) {
-    const prompt  = buildPrompt(question, answers, !!imageDataUrl, strict);
+async function callClaude(apiKey, question, answers, imageDataUrl, signal, strict, nudge) {
+    const prompt  = buildPrompt(question, answers, !!imageDataUrl, strict, nudge);
     const content = imageDataUrl ? [
         { type: "image", source: { type: "base64", media_type: "image/jpeg", data: base64(imageDataUrl) } },
         { type: "text", text: prompt }
@@ -135,8 +136,8 @@ async function callClaude(apiKey, question, answers, imageDataUrl, signal, stric
     return text;
 }
 
-async function callOpenAI(apiKey, question, answers, imageDataUrl, signal, strict) {
-    const prompt  = buildPrompt(question, answers, !!imageDataUrl, strict);
+async function callOpenAI(apiKey, question, answers, imageDataUrl, signal, strict, nudge) {
+    const prompt  = buildPrompt(question, answers, !!imageDataUrl, strict, nudge);
     const content = imageDataUrl ? [
         { type: "image_url", image_url: { url: imageDataUrl, detail: "low" } },
         { type: "text", text: prompt }
@@ -156,8 +157,8 @@ async function callOpenAI(apiKey, question, answers, imageDataUrl, signal, stric
     return text;
 }
 
-async function callGemini(apiKey, question, answers, imageDataUrl, signal, strict) {
-    const prompt = buildPrompt(question, answers, !!imageDataUrl, strict);
+async function callGemini(apiKey, question, answers, imageDataUrl, signal, strict, nudge) {
+    const prompt = buildPrompt(question, answers, !!imageDataUrl, strict, nudge);
     const parts  = imageDataUrl ? [
         { inline_data: { mime_type: "image/jpeg", data: base64(imageDataUrl) } },
         { text: prompt }
@@ -184,8 +185,8 @@ async function callGemini(apiKey, question, answers, imageDataUrl, signal, stric
     return text;
 }
 
-async function callMistral(apiKey, question, answers, imageDataUrl, signal, strict) {
-    const prompt  = buildPrompt(question, answers, !!imageDataUrl, strict);
+async function callMistral(apiKey, question, answers, imageDataUrl, signal, strict, nudge) {
+    const prompt  = buildPrompt(question, answers, !!imageDataUrl, strict, nudge);
     const model   = imageDataUrl ? "pixtral-12b-2409" : MODELS.mistral;
     const content = imageDataUrl ? [
         { type: "image_url", image_url: { url: imageDataUrl } },
