@@ -34,6 +34,8 @@
     let pendingGateTimer = null;  // readiness-gate retry handle (cancelled when a new question arrives)
     let isDragging      = false;
     let dragX = 0, dragY = 0;
+    let isResizing      = false;
+    let resizeStartX = 0, resizeStartY = 0, resizeStartW = 0, resizeStartH = 0;
     let _fadeTimer      = null;   // cancels in-flight fadeAiTo animation
 
     // ── Logging ────────────────────────────────────────────────────────────────
@@ -570,12 +572,13 @@
 
     .qa-btn--scan {
         flex: 1;
-        background: rgba(120,100,255,.1); color: #a098e0 !important;
-        border: 1px solid rgba(120,100,255,.2);
+        background: rgba(120,100,255,.18); color: #c0b8ff !important;
+        border: 1px solid rgba(120,100,255,.3);
+        box-shadow: inset 0 1px 0 rgba(255,255,255,.06);
     }
     .qa-btn--scan:hover:not(:disabled) {
-        background: rgba(120,100,255,.2); color: #c0b8ff !important;
-        border-color: rgba(120,100,255,.36);
+        background: rgba(120,100,255,.28); color: #d8d2ff !important;
+        border-color: rgba(120,100,255,.48);
     }
 
     /* nudge toggle — relative so the active-hint dot can sit in corner */
@@ -641,6 +644,31 @@
         box-shadow: 0 2px 8px rgba(74,56,204,.35);
     }
     .qa-btn--nudge-submit:hover { opacity: .84; }
+
+    /* ─ Resize handle ─ */
+    #qa-resize {
+        position: absolute; bottom: 0; right: 0;
+        width: 22px; height: 22px;
+        cursor: nwse-resize; z-index: 10;
+        border-radius: 0 0 22px 0;
+    }
+    #qa-resize::after {
+        content: "";
+        position: absolute; right: 4px; bottom: 4px;
+        width: 9px; height: 9px;
+        background:
+            linear-gradient(-45deg,
+                rgba(120,100,255,.45) 0,    rgba(120,100,255,.45) 1.5px, transparent 1.5px, transparent 33%,
+                rgba(120,100,255,.45) 33%,  rgba(120,100,255,.45) calc(33% + 1.5px), transparent calc(33% + 1.5px), transparent 66%,
+                rgba(120,100,255,.45) 66%,  rgba(120,100,255,.45) calc(66% + 1.5px), transparent calc(66% + 1.5px));
+        transition: opacity .15s; opacity: .7;
+    }
+    #qa-resize:hover::after { opacity: 1; background:
+        linear-gradient(-45deg,
+            rgba(160,140,255,.9) 0,    rgba(160,140,255,.9) 1.5px, transparent 1.5px, transparent 33%,
+            rgba(160,140,255,.9) 33%,  rgba(160,140,255,.9) calc(33% + 1.5px), transparent calc(33% + 1.5px), transparent 66%,
+            rgba(160,140,255,.9) 66%,  rgba(160,140,255,.9) calc(66% + 1.5px), transparent calc(66% + 1.5px));
+    }
     `;
 
     // ── Overlay HTML ───────────────────────────────────────────────────────────
@@ -677,7 +705,7 @@
                 <div id="qa-ai"><span class="qa-idle">Waiting for a question...</span></div>
             </div>
             <div id="qa-footer">
-                <button id="qa-scan-main" class="qa-btn qa-btn--scan">↺ Rescan</button>
+                <button id="qa-scan-main" class="qa-btn qa-btn--scan">Ask again</button>
                 <button id="qa-nudge-toggle" class="qa-btn qa-btn--nudge" title="Steer the AI with a context hint">💬</button>
             </div>
             <div id="qa-nudge-panel" class="qa-hidden">
@@ -689,6 +717,7 @@
                 </div>
             </div>
         </div>
+        <div id="qa-resize" title="Drag to resize"></div>
     `;
 
     // ── Session persistence ────────────────────────────────────────────────────
@@ -700,12 +729,30 @@
         } catch (e) {}
     }
 
+    function saveSize() {
+        try {
+            const content = document.getElementById("qa-content");
+            sessionStorage.setItem("__sheja_size", JSON.stringify({
+                width: overlay.style.width,
+                contentH: content?.style.maxHeight || ""
+            }));
+        } catch (e) {}
+    }
+
     function restorePosition() {
         try {
             const pos = JSON.parse(sessionStorage.getItem("__sheja_pos") || "null");
             if (pos?.left) {
                 overlay.style.top = pos.top; overlay.style.left = pos.left;
                 overlay.style.right = "auto"; overlay.style.transform = "none";
+            }
+        } catch (e) {}
+        try {
+            const sz = JSON.parse(sessionStorage.getItem("__sheja_size") || "null");
+            if (sz?.width) overlay.style.width = sz.width;
+            if (sz?.contentH) {
+                const content = document.getElementById("qa-content");
+                if (content) content.style.maxHeight = sz.contentH;
             }
         } catch (e) {}
         const saved = sessionStorage.getItem("__sheja_showq");
@@ -1199,12 +1246,37 @@
             overlay.classList.add("qa-dragging");
             e.preventDefault();
         });
-        document.addEventListener("mousemove", e => {
-            if (!isDragging) return;
-            overlay.style.left = Math.max(0, Math.min(e.clientX - dragX, window.innerWidth  - overlay.offsetWidth))  + "px";
-            overlay.style.top  = Math.max(0, Math.min(e.clientY - dragY, window.innerHeight - overlay.offsetHeight)) + "px";
+
+        overlay.querySelector("#qa-resize").addEventListener("mousedown", e => {
+            isResizing = true;
+            resizeStartX = e.clientX;
+            resizeStartY = e.clientY;
+            resizeStartW = overlay.offsetWidth;
+            const content = document.getElementById("qa-content");
+            resizeStartH = content ? content.offsetHeight : 300;
+            overlay.classList.add("qa-dragging");
+            e.preventDefault();
+            e.stopPropagation();
         });
-        document.addEventListener("mouseup", () => { if (isDragging) { isDragging = false; savePosition(); } });
+
+        document.addEventListener("mousemove", e => {
+            if (isDragging) {
+                overlay.style.left = Math.max(0, Math.min(e.clientX - dragX, window.innerWidth  - overlay.offsetWidth))  + "px";
+                overlay.style.top  = Math.max(0, Math.min(e.clientY - dragY, window.innerHeight - overlay.offsetHeight)) + "px";
+            }
+            if (isResizing) {
+                const newW = Math.max(240, Math.min(window.innerWidth - 24, resizeStartW + (e.clientX - resizeStartX)));
+                const newH = Math.max(120, Math.min(window.innerHeight * 0.88, resizeStartH + (e.clientY - resizeStartY)));
+                overlay.style.width = newW + "px";
+                const content = document.getElementById("qa-content");
+                if (content) content.style.maxHeight = newH + "px";
+            }
+        });
+
+        document.addEventListener("mouseup", () => {
+            if (isDragging)  { isDragging  = false; overlay.classList.remove("qa-dragging"); savePosition(); }
+            if (isResizing)  { isResizing  = false; overlay.classList.remove("qa-dragging"); saveSize(); }
+        });
 
         // Persistent rescan button — uses fresh DOM state at click time
         overlay.querySelector("#qa-scan-main").addEventListener("click", () => {
