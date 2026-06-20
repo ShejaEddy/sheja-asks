@@ -17,6 +17,7 @@
     let lastFingerprint = "";     // question + answers joined — prevents duplicate triggers
     let overlayQuestion = "";
     let overlayAnswers  = [];
+    let overlayVisualKey = "";
     let candidateQ      = "";     // best question candidate seen since last flush
     let candidateTimer  = null;
     let questionCount   = 0;
@@ -40,6 +41,14 @@
     // ── Text utilities ─────────────────────────────────────────────────────────
     function normalize(s) {
         return s.replace(/\s+/g, " ").trim();
+    }
+
+    function inViewport(rect, slack) {
+        const s = slack || 0;
+        return rect.width > 0 && rect.height > 0 &&
+            rect.top >= -s && rect.left >= -s &&
+            rect.bottom <= window.innerHeight + s &&
+            rect.right <= window.innerWidth + s;
     }
 
     const JUNK_PATTERNS = [
@@ -90,15 +99,47 @@
         return newC.length > oldC.length;
     }
 
-    // Only strips text after "?" when it looks like concatenated option labels (no spaces).
+    function compact(s) {
+        return s.toLowerCase().replace(/\s+/g, "");
+    }
+
+    function looksLikeOptionSuffix(after, answers) {
+        if (!answers?.length) return false;
+        const tail = compact(after);
+        const optionBits = answers
+            .map(a => compact(a))
+            .filter(a => a.length >= 2);
+        if (!optionBits.length) return false;
+        const hits = optionBits.filter(a => tail.includes(a)).length;
+        return hits >= Math.min(2, optionBits.length);
+    }
+
+    // Only strips text after "?" when it looks like concatenated option labels.
     // Riddle clues ("What am I? I get wetter the more I dry.") are preserved.
-    function truncateAtQuestionMark(text) {
+    function truncateAtQuestionMark(text, answers) {
         const idx = text.indexOf("?");
         if (idx === -1) return text;
         const after = text.slice(idx + 1).trim();
-        // If what follows has spaces it's a sentence (riddle clue) — keep the full text
-        if (after.length > 8 && after.includes(" ")) return text;
+        if (after.length > 8 && after.includes(" ") && !looksLikeOptionSuffix(after, answers)) return text;
         return text.slice(0, idx + 1);
+    }
+
+    function visualFingerprint() {
+        return [...document.querySelectorAll("img, canvas")]
+            .filter(el => {
+                if (el.closest("#qa-overlay")) return false;
+                const r = el.getBoundingClientRect();
+                return r.width >= 150 && r.height >= 130 && inViewport(r, 10) && (r.width / r.height) <= 2.5;
+            })
+            .map(el => {
+                const r = el.getBoundingClientRect();
+                if (el.tagName === "IMG") {
+                    return `img:${el.currentSrc || el.src}:${Math.round(r.width)}x${Math.round(r.height)}`;
+                }
+                return `canvas:${el.width}x${el.height}:${Math.round(r.width)}x${Math.round(r.height)}`;
+            })
+            .slice(0, 4)
+            .join("|");
     }
 
     // ── DOM utilities ──────────────────────────────────────────────────────────
@@ -109,7 +150,7 @@
             if (el.closest("#qa-overlay") || el.disabled) return;
             const rect = el.getBoundingClientRect();
             if (rect.width < 60 || rect.height < 20) return;
-            if (rect.top < 0 || rect.bottom > window.innerHeight) return;
+            if (!inViewport(rect)) return;
             const text = normalize(el.textContent || "");
             if (!text || text.length > 80) return;
             if (IGNORED_ANSWERS.has(text.toLowerCase()) || isJunk(text)) return;
@@ -123,7 +164,7 @@
             .find(el => {
                 if (el.closest("#qa-overlay") || el.readOnly || el.disabled) return false;
                 const r = el.getBoundingClientRect();
-                return r.width > 50 && r.height > 10 && r.top >= 0 && r.bottom <= window.innerHeight;
+                return r.width > 50 && r.height > 10 && inViewport(r);
             }) || null;
     }
 
@@ -153,7 +194,7 @@
             .filter(el => {
                 if (el.closest("#qa-overlay") || el.disabled) return false;
                 const r = el.getBoundingClientRect();
-                return r.width >= 60 && r.height >= 20 && r.top >= 0 && r.bottom <= window.innerHeight;
+                return r.width >= 60 && r.height >= 20 && inViewport(r);
             });
 
         // 1. Exact match (preferred)
@@ -176,8 +217,10 @@
         if (retries === undefined) retries = SUBMIT_RETRIES;
         const btn = [...document.querySelectorAll("button")].find(el => {
             if (el.closest("#qa-overlay") || el.disabled) return false;
+            const r = el.getBoundingClientRect();
+            if (!inViewport(r)) return false;
             const t = normalize(el.innerText || el.textContent || "").toLowerCase();
-            return t === "try" || t === "try again" || t === "submit" || t === "check";
+            return t === "try" || t === "submit" || t === "check";
         });
         if (btn) {
             log("submit", { label: normalize(btn.textContent || "") });
@@ -204,7 +247,7 @@
             if (img.closest("#qa-overlay")) return false;
             const r = img.getBoundingClientRect();
             if (r.width < 150 || r.height < 130) return false;
-            if (r.top < 50 || r.bottom > window.innerHeight || r.top > window.innerHeight * 0.85) return false;
+            if (!inViewport(r) || r.top < 50 || r.top > window.innerHeight * 0.85) return false;
             // Skip wide banners (aspect ratio > 2.5 is likely a header/ad, not a quiz image)
             return (r.width / r.height) <= 2.5;
         });
@@ -220,14 +263,15 @@
     // Scans visible DOM for a question when MutationObserver misses a transition
     function scanForCurrentQuestion() {
         let best = "";
+        const answers = extractAnswers();
         document.querySelectorAll("h1,h2,h3,h4,p,span,div,label").forEach(el => {
             if (el.closest("#qa-overlay") || el.closest("button,[role='button']")) return;
             if (el.querySelectorAll("button,[role='button']").length > 0) return;
             const rect = el.getBoundingClientRect();
-            if (rect.width < 80 || rect.top < -10 || rect.bottom > window.innerHeight + 10) return;
+            if (rect.width < 80 || !inViewport(rect, 10)) return;
             const text = normalize(el.textContent || "");
             if (text.length < 8 || text.length > 300 || isJunk(text) || !looksLikeQuestion(text)) return;
-            const clean = truncateAtQuestionMark(dedupeQuestion(text));
+            const clean = truncateAtQuestionMark(dedupeQuestion(text), answers);
             if (clean.length >= 8 && clean.trim().split(/\s+/).length >= 3 && clean.length > best.length) best = clean;
         });
         return best || null;
@@ -557,14 +601,13 @@
         });
     }
 
-    function showAnswer(answer, provider, isVisual, visualPending, autoFill) {
+    function showAnswer(answer, provider, isVisual, visualPending, autoFill, answerOptions) {
         const NAMES = { claude: "Claude", openai: "ChatGPT", gemini: "Gemini", mistral: "Mistral" };
+        const optionsForAnswer = answerOptions || overlayAnswers;
 
-        // Parse "answer — reason" or "answer - reason"
-        const dashIdx = answer.search(/\s*[—–]\s*|\s+-\s+/);
-        const raw     = (dashIdx > 0 ? answer.slice(0, dashIdx) : answer).trim();
-        const fillText = raw.replace(/\s+logo$/i, "").trim();
-        const reason   = dashIdx > 0 ? answer.slice(dashIdx).replace(/^\s*[-—–]\s*/, "").trim() : "";
+        const parsed = parseAnswer(answer, optionsForAnswer);
+        const fillText = parsed.fillText;
+        const reason   = parsed.reason;
 
         // Single letter/digit choice (A–E, 1–9) → show as badge
         const choiceMatch = fillText.match(/^([A-Ea-e]|[1-9])\.?$/);
@@ -632,7 +675,7 @@
                 wrap.appendChild(reasonEl);
             }
 
-            if (!overlayAnswers.length) {
+            if (!optionsForAnswer.length) {
                 const hint = document.createElement("div");
                 hint.className = "qa-hint";
                 hint.textContent = "📝 Open question — click answer to fill";
@@ -653,9 +696,13 @@
             scanBtn.textContent = "↺ Scan";
             scanBtn.addEventListener("click", () => {
                 // Prefer fresh DOM state at click time — quiz may have advanced since render
-                const freshQ = scanForCurrentQuestion() || overlayQuestion;
+                const scannedQ = scanForCurrentQuestion();
+                const freshQ = scannedQ || overlayQuestion;
                 const freshA = extractAnswers();
-                scanScreen(freshQ, freshA.length >= 2 ? freshA : overlayAnswers);
+                const sameKnownQuestion = scannedQ && scannedQ === overlayQuestion;
+                const sameVisualContext = visualFingerprint() === overlayVisualKey;
+                const scanAnswers = freshA.length >= 2 ? freshA : (sameKnownQuestion && sameVisualContext ? overlayAnswers : []);
+                scanScreen(freshQ, scanAnswers);
             });
             btnRow.appendChild(scanBtn);
             wrap.appendChild(btnRow);
@@ -667,6 +714,34 @@
         });
     }
 
+    function parseAnswer(answer, answerOptions) {
+        const text = normalize(answer || "");
+        if (answerOptions?.length) {
+            const options = [...answerOptions].sort((a, b) => b.length - a.length);
+            const lower = text.toLowerCase();
+            const option = options.find(opt => {
+                const o = opt.toLowerCase();
+                return lower === o ||
+                    lower.startsWith(o + " — ") ||
+                    lower.startsWith(o + " – ") ||
+                    lower.startsWith(o + " - ");
+            });
+            if (option) {
+                const rest = text.slice(option.length).trim();
+                return {
+                    fillText: option,
+                    reason: rest.replace(/^[—–-]\s*/, "").trim()
+                };
+            }
+        }
+
+        const match = text.match(/^(.+?)\s+[—–-]\s+(.+)$/);
+        return {
+            fillText: (match ? match[1] : text).trim(),
+            reason: match ? match[2].trim() : ""
+        };
+    }
+
     // ── Screenshot ─────────────────────────────────────────────────────────────
     function captureScreen(callback) {
         overlay.style.visibility = "hidden";
@@ -676,7 +751,7 @@
             const pending = [...document.querySelectorAll("img")].find(img => {
                 if (img.closest("#qa-overlay") || img.complete) return false;
                 const r = img.getBoundingClientRect();
-                return r.width > 180 && r.height > 130 && r.top < window.innerHeight && r.bottom > 0;
+                return r.width > 180 && r.height > 130 && inViewport(r, 10);
             });
             if (!pending || Date.now() >= deadline) {
                 requestAnimationFrame(() => setTimeout(() => {
@@ -706,7 +781,7 @@
                 if (myId !== reqId) return;
                 if (resp?.answer) {
                     log("resp", { id: myId, ans: resp.answer, prov: resp.provider });
-                    showAnswer(resp.answer, resp.provider, true, false, autoFill);
+                    showAnswer(resp.answer, resp.provider, true, false, autoFill, ans);
                 } else {
                     log("err", { id: myId, error: resp?.error });
                     showError(resp?.error ?? "No response from AI");
@@ -737,7 +812,7 @@
                 visualDone = true;
                 if (!dataUrl) {
                     log("err", { id: myId, error: err, mode: "screenshot" });
-                    if (textDraftAns) showAnswer(textDraftAns, textDraftProv, false, false, autoFill);
+                    if (textDraftAns) showAnswer(textDraftAns, textDraftProv, false, false, autoFill, ans);
                     else showError(err || "Screenshot failed");
                     return;
                 }
@@ -746,10 +821,10 @@
                     if (myId !== reqId) return;
                     if (resp?.answer) {
                         log("resp", { id: myId, ans: resp.answer, prov: resp.provider, mode: "vision" });
-                        showAnswer(resp.answer, resp.provider, true, false, autoFill);
+                        showAnswer(resp.answer, resp.provider, true, false, autoFill, ans);
                     } else {
                         log("err", { id: myId, error: resp?.error, mode: "vision" });
-                        if (textDraftAns) showAnswer(textDraftAns, textDraftProv, false, false, autoFill);
+                        if (textDraftAns) showAnswer(textDraftAns, textDraftProv, false, false, autoFill, ans);
                         else showError(resp?.error ?? "No response from AI");
                     }
                 });
@@ -764,7 +839,7 @@
             if (myId !== reqId) return;
             if (resp?.answer) {
                 log("resp", { id: myId, ans: resp.answer, prov: resp.provider, mode: "text" });
-                showAnswer(resp.answer, resp.provider, false, false, autoFill);
+                showAnswer(resp.answer, resp.provider, false, false, autoFill, ans);
             } else {
                 log("err", { id: myId, error: resp?.error, mode: "text" });
                 showError(resp?.error ?? "No response from AI");
@@ -886,17 +961,20 @@
     // ── Question recording ─────────────────────────────────────────────────────
     function recordQuestion(questionText) {
         const answers     = extractAnswers();
-        const fingerprint = questionText + "\n" + answers.join("|");
+        const question    = truncateAtQuestionMark(dedupeQuestion(questionText), answers);
+        const visualKey   = (detectVisualQuestion() || looksLikeVisualQuestion(question)) ? visualFingerprint() : "";
+        const fingerprint = question + "\n" + answers.join("|") + "\n" + visualKey;
         if (fingerprint === lastFingerprint) return;
         lastFingerprint = fingerprint;
         questionCount++;
 
-        overlayQuestion = questionText;
-        overlayAnswers  = answers.length >= 2 ? answers : [];
+        overlayQuestion  = question;
+        overlayAnswers   = answers.length >= 2 ? answers : [];
+        overlayVisualKey = visualKey;
 
-        log("question", { q: questionText, opts: overlayAnswers, count: questionCount });
+        log("question", { q: question, opts: overlayAnswers, visualKey, count: questionCount });
         updateOverlay();
-        askAI(questionText, overlayAnswers);
+        askAI(question, overlayAnswers);
     }
 
     // ── Question detection ─────────────────────────────────────────────────────
@@ -905,7 +983,8 @@
         if (text.length < 8 || text.length > 300) return;
         if (isJunk(text) || !looksLikeQuestion(text)) return;
 
-        const clean = truncateAtQuestionMark(dedupeQuestion(text));
+        const deduped = dedupeQuestion(text);
+        const clean = truncateAtQuestionMark(deduped, deduped.includes("?") ? extractAnswers() : []);
 
         if (clean.length < 8 || clean.trim().split(/\s+/).length < 3) return;
         if (isBetterCandidate(clean, candidateQ)) candidateQ = clean;
@@ -962,8 +1041,11 @@
         pollInterval = setInterval(() => {
             if (!overlayQuestion) return;
             const current = extractAnswers();
-            if (current.length < 2 || current.join("|") === overlayAnswers.join("|")) return;
             const freshQ = scanForCurrentQuestion() || overlayQuestion;
+            const currentVisualKey = (detectVisualQuestion() || looksLikeVisualQuestion(freshQ)) ? visualFingerprint() : "";
+            const sameAnswers = current.join("|") === overlayAnswers.join("|");
+            const sameVisual = currentVisualKey === overlayVisualKey;
+            if ((current.length < 2 && !currentVisualKey) || (sameAnswers && sameVisual)) return;
             if (freshQ) recordQuestion(freshQ);
         }, POLL_MS);
     }

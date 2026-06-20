@@ -4,11 +4,10 @@
   "version": "1.2",
   "description": "AI-powered quiz helper — get answers as you play",
   "permissions": [
-    "storage",
-    "tabs"
+    "storage"
   ],
   "host_permissions": [
-    "https://*.quiz.com/*"
+    "<all_urls>"
   ],
   "background": {
     "service_worker": "background.js"
