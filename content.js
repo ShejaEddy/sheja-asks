@@ -37,6 +37,7 @@
     let isResizing      = false;
     let resizeStartX = 0, resizeStartY = 0, resizeStartW = 0, resizeStartH = 0;
     let _fadeTimer      = null;   // cancels in-flight fadeAiTo animation
+    let answerEls       = new Map(); // normKey(optionText) → live option element, captured when a question is dispatched
 
     // ── Logging ────────────────────────────────────────────────────────────────
     let logSeq = 0;
@@ -53,6 +54,27 @@
     // ── Text utilities ─────────────────────────────────────────────────────────
     function normalize(s) {
         return s.replace(/\s+/g, " ").trim();
+    }
+
+    // Canonical match key shared by answer capture and click-time resolution:
+    // strip diacritics, lowercase, collapse punctuation/symbols/whitespace.
+    function normKey(s) {
+        return (s || "")
+            .normalize("NFKD").replace(/[̀-ͯ]/g, "")
+            .toLowerCase()
+            .replace(/[^\p{L}\p{N}\s]/gu, " ")
+            .replace(/\s+/g, " ")
+            .trim();
+    }
+
+    // Fraction of `want`'s tokens present in `have` (relative to the larger set).
+    function tokenOverlap(haveKey, wantKey) {
+        const have = new Set(haveKey.split(" ").filter(Boolean));
+        const want = wantKey.split(" ").filter(Boolean);
+        if (!have.size || !want.length) return 0;
+        let hit = 0;
+        for (const w of want) if (have.has(w)) hit++;
+        return hit / Math.max(have.size, want.length);
     }
 
     function inViewport(rect, slack) {
@@ -222,8 +244,12 @@
         el.dispatchEvent(new Event("change", { bubbles: true }));
     }
 
-    // Fires the full pointer + mouse sequence so React event handlers register the click
+    // Fires the full pointer + mouse sequence (so React handlers register) plus a native
+    // click() fallback, after bringing the element into view and focusing it.
     function simulateClick(el) {
+        if (!el) return;
+        try { el.scrollIntoView({ block: "center", inline: "center" }); } catch (e) {}
+        try { el.focus?.({ preventScroll: true }); } catch (e) {}
         const r  = el.getBoundingClientRect();
         const cx = r.left + r.width  / 2;
         const cy = r.top  + r.height / 2;
@@ -231,29 +257,64 @@
         ["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach(type =>
             el.dispatchEvent(new (type.startsWith("pointer") ? PointerEvent : MouseEvent)(type, opts))
         );
+        // quiz.com options are select-one (idempotent), so a second native click is safe and
+        // covers handlers that ignore synthetic events.
+        try { el.click(); } catch (e) {}
+    }
+
+    // The clickable, on-screen option elements right now.
+    function liveOptionEls() {
+        return [...document.querySelectorAll("button, [role='button'], [role='option']")].filter(el => {
+            if (el.closest("#qa-overlay") || el.disabled) return false;
+            const r = el.getBoundingClientRect();
+            return r.width >= 60 && r.height >= 20 && inViewport(r);
+        });
+    }
+
+    // The element that actually handles the click (a matched inner <span> isn't it).
+    function clickableFrom(el) {
+        return el?.closest("button, [role='button'], [role='option'], label, li[role]") || el;
+    }
+
+    // Is a previously-captured option element still usable?
+    function isLiveOption(el) {
+        if (!el || !el.isConnected || el.closest("#qa-overlay") || el.disabled) return false;
+        const r = el.getBoundingClientRect();
+        return r.width >= 40 && r.height >= 18 && inViewport(r, 4);
+    }
+
+    // Snapshot option text → element at the moment a question is dispatched, so click-time
+    // has the exact nodes that were on screen when the AI was asked.
+    function captureAnswerEls() {
+        answerEls = new Map();
+        liveOptionEls().forEach(el => {
+            const k = normKey(el.textContent || "");
+            if (k && !answerEls.has(k)) answerEls.set(k, el);
+        });
     }
 
     function clickAnswer(text) {
-        const target = text.toLowerCase().trim();
-        const candidates = [...document.querySelectorAll("button, [role='button'], [role='option']")]
-            .filter(el => {
-                if (el.closest("#qa-overlay") || el.disabled) return false;
-                const r = el.getBoundingClientRect();
-                return r.width >= 60 && r.height >= 20 && inViewport(r);
-            });
+        const want = normKey(text);
+        if (!want) return false;
 
-        // 1. Exact match (preferred)
-        let el = candidates.find(el => normalize(el.innerText || el.textContent || "").toLowerCase() === target);
-        // 2. Button text starts with answer (e.g. button has trailing emoji or punctuation)
-        if (!el) el = candidates.find(el => normalize(el.innerText || el.textContent || "").toLowerCase().startsWith(target));
-        // 3. Answer starts with full button text (button is a prefix of the answer text)
-        //    Require button text >= 4 chars to prevent single-letter false matches
-        if (!el) el = candidates.find(el => {
-            const t = normalize(el.innerText || el.textContent || "").toLowerCase();
-            return t.length >= 4 && target.startsWith(t);
-        });
+        // 1. The element captured at dispatch time, if it's still live (avoids the re-query race).
+        const stored = answerEls.get(want);
+        if (isLiveOption(stored)) { simulateClick(clickableFrom(stored)); return true; }
 
-        if (el) { simulateClick(el); return true; }
+        // 2. Re-resolve against the current DOM with the shared matcher.
+        const cands = liveOptionEls().map(el => ({ el, key: normKey(el.textContent || "") })).filter(c => c.key);
+        let m =
+            cands.find(c => c.key === want) ||                                           // exact
+            cands.find(c => c.key.startsWith(want)) ||                                    // option starts with answer
+            cands.find(c => want.startsWith(c.key) && c.key.length >= 4) ||               // answer starts with option
+            cands.find(c => c.key.includes(want) || want.includes(c.key));                // either contains the other
+        if (!m) {                                                                          // token overlap ≥ 0.6
+            let best = null, bestScore = 0.6;
+            for (const c of cands) { const s = tokenOverlap(c.key, want); if (s > bestScore) { bestScore = s; best = c; } }
+            m = best;
+        }
+
+        if (m) { simulateClick(clickableFrom(m.el)); return true; }
         return false;
     }
 
@@ -353,322 +414,294 @@
     const overlayStyle = document.createElement("style");
     overlayStyle.textContent = `
     #qa-overlay {
-        position: fixed; top: 50%; right: 20px;
-        transform: translateY(-50%);
-        width: min(320px, calc(100vw - 24px));
-        background: rgba(9, 8, 22, 0.97);
-        -webkit-backdrop-filter: blur(24px) saturate(1.4);
-        backdrop-filter: blur(24px) saturate(1.4);
-        border: 1px solid rgba(120,100,255,.22);
-        border-radius: 22px;
+        --qa-bg: rgba(14, 12, 28, 0.97);
+        --qa-surface: rgba(255,255,255,.045);
+        --qa-border: rgba(132,112,255,.20);
+        --qa-border-strong: rgba(132,112,255,.42);
+        --qa-text: #ece9f8;
+        --qa-text-dim: #a39ecb;
+        --qa-text-faint: #726d9e;
+        --qa-accent: #8b6dff;
+        --qa-accent-2: #bb93ff;
+        --qa-ok: #46e3a0;
+        --qa-warn: #ffce5c;
+        --qa-err: #ff7d8a;
+
+        position: fixed; top: 50%; right: 20px; transform: translateY(-50%);
+        width: min(340px, calc(100vw - 24px));
+        background: var(--qa-bg);
+        -webkit-backdrop-filter: blur(26px) saturate(1.5);
+        backdrop-filter: blur(26px) saturate(1.5);
+        border: 1px solid var(--qa-border);
+        border-radius: 18px;
         z-index: 2147483647 !important;
         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif !important;
-        font-size: 13px !important; color: #e8e6f6 !important;
-        box-shadow: 0 24px 60px rgba(0,0,0,.7), 0 0 0 1px rgba(120,100,255,.06),
-                    inset 0 1px 0 rgba(255,255,255,.05);
-        overflow: hidden; transition: box-shadow .2s;
+        font-size: 13px !important; color: var(--qa-text) !important;
+        box-shadow: 0 28px 70px rgba(0,0,0,.66), 0 0 0 1px rgba(132,112,255,.05),
+                    inset 0 1px 0 rgba(255,255,255,.06);
+        overflow: hidden; transition: box-shadow .2s, opacity .2s;
     }
-    #qa-overlay.qa-dragging { box-shadow: 0 36px 80px rgba(0,0,0,.75); }
+    #qa-overlay.qa-dragging { box-shadow: 0 40px 90px rgba(0,0,0,.72); }
+    #qa-overlay.qa-paused { opacity: .94; }
     #qa-overlay * { box-sizing: border-box !important; line-height: normal !important; }
+    #qa-overlay :focus-visible {
+        outline: 2px solid var(--qa-accent-2) !important; outline-offset: 2px !important; border-radius: 7px;
+    }
 
     /* ─ Header ─ */
     #qa-header {
-        display: flex; align-items: center;
-        padding: 10px 11px 10px 14px;
-        background: linear-gradient(135deg, #4a38cc 0%, #7553e0 50%, #a46de6 100%);
-        border-bottom: 1px solid rgba(0,0,0,.25);
-        cursor: grab; user-select: none; gap: 8px;
+        display: flex; align-items: center; gap: 8px;
+        padding: 11px 11px 11px 14px;
+        background: linear-gradient(135deg, #5a44d6 0%, #7d5ae6 55%, #a877ec 100%);
+        border-bottom: 1px solid rgba(0,0,0,.22);
+        cursor: grab; user-select: none;
     }
+    #qa-overlay.qa-paused #qa-header { background: linear-gradient(135deg, #4a4a5e, #6c6c86); }
     #qa-header:active { cursor: grabbing; }
     #qa-title {
-        font-weight: 800 !important; font-size: 13.5px !important;
-        color: #fff !important; white-space: nowrap;
-        display: flex; align-items: center; gap: 6px;
-        text-shadow: 0 1px 4px rgba(0,0,0,.3); flex-shrink: 0;
-        letter-spacing: -.1px;
+        font-weight: 800 !important; font-size: 13.5px !important; color: #fff !important;
+        white-space: nowrap; display: flex; align-items: center; gap: 6px;
+        text-shadow: 0 1px 4px rgba(0,0,0,.3); flex-shrink: 0; letter-spacing: -.1px;
     }
     #qa-q-count {
-        font-size: 9px !important; font-weight: 700 !important;
-        background: rgba(0,0,0,.28); color: rgba(255,255,255,.75) !important;
-        border-radius: 8px; padding: 1px 5px; letter-spacing: .2px;
+        font-size: 10px !important; font-weight: 700 !important;
+        background: rgba(0,0,0,.26); color: rgba(255,255,255,.85) !important;
+        border-radius: 7px; padding: 1px 6px;
     }
     #qa-status {
-        flex: 1; text-align: center;
-        font-size: 9px !important; font-weight: 700 !important;
-        letter-spacing: .6px; text-transform: uppercase;
-        color: rgba(255,255,255,.38) !important;
-        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px;
+        font-size: 11px !important; font-weight: 700 !important;
+        color: rgba(255,255,255,.62) !important; white-space: nowrap; overflow: hidden;
     }
-    #qa-status.qa-s-busy { color: #cfc5ff !important; animation: qa-blink 1.1s ease-in-out infinite; }
-    #qa-status.qa-s-ok   { color: #7dffc0 !important; }
-    #qa-status.qa-s-err  { color: #ff9999 !important; }
-    @keyframes qa-blink { 0%,100%{opacity:.45} 50%{opacity:1} }
+    #qa-status .qa-led { width: 7px; height: 7px; border-radius: 50%; background: currentColor;
+        box-shadow: 0 0 6px currentColor; flex-shrink: 0; }
+    #qa-status.qa-s-busy { color: #fff !important; }
+    #qa-status.qa-s-busy .qa-led { animation: qa-pulse-led 1s ease-in-out infinite; }
+    #qa-status.qa-s-ok   { color: #b9ffe0 !important; }
+    #qa-status.qa-s-warn { color: #ffe6a6 !important; }
+    #qa-status.qa-s-err  { color: #ffc0c6 !important; }
+    @keyframes qa-pulse-led { 0%,100%{opacity:.35} 50%{opacity:1} }
 
     #qa-controls { display: flex; gap: 4px; align-items: center; flex-shrink: 0; }
     .qa-icon-btn {
-        background: rgba(255,255,255,.1); border: 1px solid rgba(255,255,255,.14);
-        color: rgba(255,255,255,.85) !important; width: 25px; height: 25px; border-radius: 8px;
-        cursor: pointer; font-size: 11px !important; font-weight: 700 !important;
+        background: rgba(255,255,255,.12); border: 1px solid rgba(255,255,255,.16);
+        color: #fff !important; width: 26px; height: 26px; border-radius: 8px;
+        cursor: pointer; font-size: 12px !important; font-weight: 700 !important;
         display: flex; align-items: center; justify-content: center;
-        transition: background .15s, border-color .15s; flex-shrink: 0; padding: 0; letter-spacing: 0;
+        transition: background .15s, border-color .15s; flex-shrink: 0; padding: 0;
     }
-    .qa-icon-btn:hover { background: rgba(255,255,255,.24); border-color: rgba(255,255,255,.28); }
-    .qa-icon-btn.qa-on { background: rgba(255,255,255,.28); border-color: rgba(255,255,255,.4); }
+    .qa-icon-btn:hover { background: rgba(255,255,255,.26); border-color: rgba(255,255,255,.34); }
+    .qa-icon-btn.qa-on { background: #fff; color: #5a44d6 !important; border-color: #fff; }
 
     /* ─ Content ─ */
     #qa-content {
-        max-height: calc(88vh - 50px); overflow-y: auto;
-        padding: 10px 10px 8px; display: flex; flex-direction: column; gap: 7px;
+        max-height: calc(86vh - 52px); overflow-y: auto;
+        padding: 11px; display: flex; flex-direction: column; gap: 9px;
     }
-    #qa-content::-webkit-scrollbar { width: 3px; }
-    #qa-content::-webkit-scrollbar-thumb { background: rgba(120,100,255,.28); border-radius: 3px; }
+    #qa-content::-webkit-scrollbar { width: 6px; }
+    #qa-content::-webkit-scrollbar-thumb { background: rgba(132,112,255,.34); border-radius: 6px; }
 
     .qa-section {
-        background: rgba(255,255,255,.028); border-radius: 13px;
-        padding: 9px 12px; border: 1px solid rgba(120,100,255,.11);
+        background: var(--qa-surface); border-radius: 13px;
+        padding: 10px 12px; border: 1px solid var(--qa-border);
     }
     .qa-hidden { display: none !important; }
     .qa-label {
-        font-size: 8.5px !important; font-weight: 800 !important;
-        letter-spacing: 1.5px; color: #625e9a !important;
+        font-size: 10px !important; font-weight: 800 !important;
+        letter-spacing: .8px; color: var(--qa-text-dim) !important;
         margin-bottom: 7px; text-transform: uppercase;
-        display: flex; align-items: center; justify-content: space-between;
+        display: flex; align-items: center; justify-content: space-between; gap: 6px;
     }
     .qa-provider-badge {
-        font-size: 8.5px !important; font-weight: 700 !important;
-        background: rgba(120,100,255,.12); color: #b0a8ff !important;
-        border: 1px solid rgba(120,100,255,.2); border-radius: 5px; padding: 1px 6px;
-        letter-spacing: .3px;
+        font-size: 10px !important; font-weight: 700 !important;
+        background: rgba(132,112,255,.16); color: var(--qa-accent-2) !important;
+        border: 1px solid rgba(132,112,255,.28); border-radius: 6px; padding: 1px 7px;
+        text-transform: none; letter-spacing: 0;
     }
 
     #qa-question {
-        line-height: 1.65 !important; color: #eae6fb !important;
-        font-size: 13px !important; font-weight: 500 !important;
+        line-height: 1.6 !important; color: var(--qa-text) !important;
+        font-size: 13.5px !important; font-weight: 500 !important;
     }
-    #qa-timestamp { font-size: 9px !important; color: #565080 !important; font-style: italic; }
+    #qa-timestamp {
+        font-size: 10px !important; color: var(--qa-text-faint) !important; font-weight: 600 !important;
+        text-transform: none; letter-spacing: 0;
+    }
     #qa-options {
         list-style: none !important; margin: 0 !important; padding: 0 !important;
-        display: flex; flex-direction: column; gap: 4px;
+        display: flex; flex-direction: column; gap: 5px;
     }
     #qa-options li {
-        background: rgba(120,100,255,.06); border: 1px solid rgba(120,100,255,.1);
+        background: rgba(132,112,255,.08); border: 1px solid rgba(132,112,255,.14);
         border-radius: 8px; padding: 6px 10px;
-        color: #c4c0e6 !important; font-size: 12px !important; font-weight: 500 !important;
+        color: var(--qa-text) !important; font-size: 12.5px !important; font-weight: 500 !important;
     }
-    #qa-options li::before { content: "› "; color: #8870e8 !important; font-weight: 700 !important; }
+    #qa-options li::before { content: "› "; color: var(--qa-accent) !important; font-weight: 700 !important; }
     #qa-options li.qa-none {
-        color: #4e4a78 !important; font-style: italic; font-size: 11.5px !important;
+        color: var(--qa-text-faint) !important; font-style: italic; font-size: 12px !important;
         background: transparent !important; border: none !important; padding: 2px 0 !important;
     }
     #qa-options li.qa-none::before { content: none !important; }
 
-    /* ─ Answer card ─ */
+    /* ─ Answer card (state accents: ok / warn / err) ─ */
     .qa-section--answer {
-        background: rgba(255,255,255,.025);
-        border: 1px solid rgba(120,100,255,.14);
-        transition: border-color .4s, background .4s, box-shadow .4s;
-        padding-bottom: 10px;
+        background: var(--qa-surface); border: 1px solid var(--qa-border);
+        transition: border-color .35s, background .35s, box-shadow .35s;
     }
-    .qa-section--answer.qa-answered {
-        background: rgba(45,190,115,.045);
-        border-color: rgba(50,205,125,.26);
-        box-shadow: inset 0 0 0 1px rgba(50,205,125,.06);
-    }
-    .qa-section--answer .qa-label { color: #706aac !important; }
-    .qa-section--answer.qa-answered .qa-label { color: #4ad890 !important; }
+    .qa-section--answer.qa-state-ok   { background: rgba(70,227,160,.06); border-color: rgba(70,227,160,.32); }
+    .qa-section--answer.qa-state-warn { background: rgba(255,206,92,.06);  border-color: rgba(255,206,92,.34); }
+    .qa-section--answer.qa-state-err  { background: rgba(255,125,138,.06); border-color: rgba(255,125,138,.34); }
+    .qa-section--answer .qa-label { color: var(--qa-text-dim) !important; }
+    .qa-section--answer.qa-state-ok   .qa-label { color: var(--qa-ok) !important; }
+    .qa-section--answer.qa-state-warn .qa-label { color: var(--qa-warn) !important; }
     .qa-section--answer.qa-pulse { animation: qa-pulse-in .5s ease; }
     @keyframes qa-pulse-in {
-        0%   { box-shadow: inset 0 0 0 1px rgba(50,205,125,.06); }
-        45%  { box-shadow: inset 0 0 0 1px rgba(50,205,125,.06), 0 0 0 4px rgba(50,205,125,.1); }
-        100% { box-shadow: inset 0 0 0 1px rgba(50,205,125,.06); }
+        0%   { box-shadow: 0 0 0 0 rgba(132,112,255,0); }
+        45%  { box-shadow: 0 0 0 4px rgba(132,112,255,.16); }
+        100% { box-shadow: 0 0 0 0 rgba(132,112,255,0); }
     }
 
     #qa-ai {
-        min-height: 26px; display: flex; flex-direction: column; gap: 8px;
+        min-height: 28px; display: flex; flex-direction: column; gap: 9px;
         transition: opacity .16s ease, transform .16s ease;
     }
-    .qa-idle {
-        color: #46426a !important; font-style: italic; font-size: 12px !important;
-        padding: 4px 0; animation: qa-breathe 3s ease-in-out infinite;
-    }
-    @keyframes qa-breathe { 0%,100%{opacity:.28} 50%{opacity:.7} }
+    .qa-idle { color: var(--qa-text-faint) !important; font-size: 12.5px !important; padding: 3px 0; }
 
+    /* loading — spinner ring (distinct from idle / answered) */
     .qa-loading {
-        display: flex; align-items: center; gap: 9px; padding: 4px 0;
-        color: #a098e0 !important; font-size: 12px !important; font-weight: 500 !important;
+        display: flex; align-items: center; gap: 10px; padding: 3px 0;
+        color: var(--qa-text-dim) !important; font-size: 12.5px !important; font-weight: 600 !important;
     }
-    .qa-dots { display: flex; gap: 4px; align-items: center; flex-shrink: 0; }
-    .qa-dots span {
-        width: 5px; height: 5px; border-radius: 50%; background: #8868e0;
-        animation: qa-bounce .85s ease-in-out infinite;
+    .qa-spinner {
+        width: 16px; height: 16px; border-radius: 50%; flex-shrink: 0;
+        border: 2px solid rgba(132,112,255,.25); border-top-color: var(--qa-accent-2);
+        animation: qa-spin .7s linear infinite;
     }
-    .qa-dots span:nth-child(2) { animation-delay: .17s; }
-    .qa-dots span:nth-child(3) { animation-delay: .34s; }
-    @keyframes qa-bounce {
-        0%,60%,100% { transform: translateY(0); opacity: .38; }
-        30%          { transform: translateY(-5px); opacity: 1; }
-    }
+    @keyframes qa-spin { to { transform: rotate(360deg); } }
 
+    /* answer */
     .qa-answer-wrap {
-        display: flex; flex-direction: column; gap: 7px;
-        animation: qa-appear .28s cubic-bezier(.34,1.56,.64,1);
+        display: flex; flex-direction: column; gap: 8px;
+        animation: qa-appear .26s cubic-bezier(.34,1.56,.64,1);
     }
     @keyframes qa-appear {
-        from { opacity: 0; transform: translateY(6px) scale(.97); }
-        to   { opacity: 1; transform: translateY(0) scale(1); }
+        from { opacity: 0; transform: translateY(6px) scale(.98); }
+        to   { opacity: 1; transform: none; }
     }
-    .qa-answer-row { display: flex; align-items: center; gap: 9px; }
+    .qa-answer-row { display: flex; align-items: center; gap: 10px; }
     .qa-badge {
         display: inline-flex; align-items: center; justify-content: center;
-        min-width: 36px; height: 36px; padding: 0 6px; flex-shrink: 0;
-        background: linear-gradient(135deg, #4a38cc, #8860e8);
-        color: #fff !important; font-size: 18px !important; font-weight: 900 !important;
-        border-radius: 10px; box-shadow: 0 4px 12px rgba(74,56,204,.38);
+        min-width: 38px; height: 38px; padding: 0 7px; flex-shrink: 0;
+        background: linear-gradient(135deg, #5a44d6, #9a6cf0);
+        color: #fff !important; font-size: 19px !important; font-weight: 900 !important;
+        border-radius: 11px; box-shadow: 0 5px 14px rgba(90,68,214,.42);
     }
     .qa-answer-text {
-        color: #52ecaa !important; font-weight: 800 !important;
-        font-size: 19px !important; line-height: 1.2 !important; cursor: pointer;
-        letter-spacing: -.2px;
+        color: var(--qa-ok) !important; font-weight: 800 !important;
+        font-size: 20px !important; line-height: 1.2 !important; cursor: pointer;
+        letter-spacing: -.2px; border-radius: 7px; flex: 1;
     }
-    .qa-answer-text:hover { color: #6fffc0 !important; text-decoration: underline; }
-    .qa-answer-text--sm { font-size: 14.5px !important; letter-spacing: 0; }
-    .qa-answer-text--guess { color: #ffd060 !important; }
-    .qa-answer-text--guess:hover { color: #ffe080 !important; }
-    .qa-answer-text.qa-filled {
-        opacity: .3 !important; text-decoration: line-through !important; cursor: default !important;
+    .qa-answer-text:hover { color: #74ffc4 !important; text-decoration: underline; }
+    .qa-answer-text--sm { font-size: 15px !important; letter-spacing: 0; }
+    .qa-answer-text--guess { color: var(--qa-warn) !important; }
+    .qa-answer-text--guess:hover { color: #ffe08a !important; }
+    .qa-answer-text.qa-filled { opacity: .32 !important; text-decoration: line-through !important; cursor: default !important; }
+
+    /* confidence chip */
+    .qa-chip {
+        flex-shrink: 0; font-size: 10px !important; font-weight: 800 !important;
+        border-radius: 999px; padding: 2px 9px;
     }
+    .qa-chip--ok  { background: rgba(70,227,160,.16);  color: var(--qa-ok) !important;       border: 1px solid rgba(70,227,160,.3); }
+    .qa-chip--mid { background: rgba(132,112,255,.16); color: var(--qa-accent-2) !important; border: 1px solid rgba(132,112,255,.3); }
+    .qa-chip--low { background: rgba(255,206,92,.14);  color: var(--qa-warn) !important;     border: 1px solid rgba(255,206,92,.32); }
+
     .qa-guess-note {
-        font-size: 10px !important; color: #ffc040 !important; font-weight: 600 !important;
-        background: rgba(255,170,40,.07); border: 1px solid rgba(255,170,40,.16);
-        border-radius: 6px; padding: 3px 9px;
+        font-size: 11px !important; color: var(--qa-warn) !important; font-weight: 600 !important;
+        background: rgba(255,206,92,.08); border: 1px solid rgba(255,206,92,.2);
+        border-radius: 7px; padding: 5px 10px;
     }
-    .qa-reason {
-        color: #635f92 !important; font-size: 10.5px !important;
-        font-style: italic; line-height: 1.55 !important;
-    }
+    .qa-reason { color: var(--qa-text-dim) !important; font-size: 12px !important; line-height: 1.5 !important; }
     .qa-hint {
-        font-size: 10.5px !important; color: #42d898 !important; font-weight: 600 !important;
-        background: rgba(50,205,125,.06); border: 1px solid rgba(50,205,125,.14);
-        border-radius: 6px; padding: 3px 9px;
+        font-size: 11.5px !important; color: var(--qa-ok) !important; font-weight: 600 !important;
+        background: rgba(70,227,160,.07); border: 1px solid rgba(70,227,160,.18);
+        border-radius: 7px; padding: 5px 10px;
     }
-    .qa-visual-pending {
-        font-size: 11px !important; color: #a098e0 !important;
-        font-style: italic; animation: qa-breathe 2s ease-in-out infinite;
+    .qa-error {
+        color: var(--qa-err) !important; font-size: 12.5px !important; font-weight: 600 !important;
+        background: rgba(255,125,138,.08); border: 1px solid rgba(255,125,138,.24);
+        border-radius: 8px; padding: 8px 11px;
     }
-    .qa-error { color: #ff7a7a !important; font-size: 12px !important; font-weight: 500 !important; }
 
     /* ─ Footer ─ */
-    #qa-footer { display: flex; gap: 6px; align-items: center; }
+    #qa-footer { display: flex; gap: 7px; align-items: stretch; }
     .qa-btn {
-        display: inline-flex; align-items: center; justify-content: center;
-        padding: 7px 11px; border-radius: 9px;
-        font-size: 11.5px !important; font-weight: 700 !important;
+        display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+        padding: 9px 12px; border-radius: 10px;
+        font-size: 12.5px !important; font-weight: 700 !important;
         cursor: pointer; transition: background .15s, transform .1s, border-color .15s;
-        border: none; line-height: 1 !important; letter-spacing: .15px;
+        border: 1px solid transparent; line-height: 1 !important;
     }
     .qa-btn:hover:not(:disabled) { transform: translateY(-1px); }
     .qa-btn:active:not(:disabled) { transform: translateY(0); }
-    .qa-btn:disabled { opacity: .4; cursor: default; transform: none; }
+    .qa-btn:disabled { opacity: .45; cursor: default; transform: none; }
 
     .qa-btn--scan {
-        flex: 1;
-        background: rgba(120,100,255,.18); color: #c0b8ff !important;
-        border: 1px solid rgba(120,100,255,.3);
-        box-shadow: inset 0 1px 0 rgba(255,255,255,.06);
+        flex: 1; background: rgba(132,112,255,.2); color: #d8d0ff !important;
+        border-color: rgba(132,112,255,.34);
     }
-    .qa-btn--scan:hover:not(:disabled) {
-        background: rgba(120,100,255,.28); color: #d8d2ff !important;
-        border-color: rgba(120,100,255,.48);
-    }
+    .qa-btn--scan:hover:not(:disabled) { background: rgba(132,112,255,.32); border-color: var(--qa-border-strong); }
 
-    /* nudge toggle — relative so the active-hint dot can sit in corner */
     .qa-btn--nudge {
-        position: relative;
-        background: rgba(255,255,255,.04); color: #5e5a8a !important;
-        border: 1px solid rgba(255,255,255,.07); padding: 7px 10px; font-size: 13px !important;
+        position: relative; background: rgba(255,255,255,.05); color: var(--qa-text-dim) !important;
+        border-color: rgba(255,255,255,.1); padding: 9px 12px;
     }
-    .qa-btn--nudge:hover:not(:disabled) { background: rgba(255,255,255,.1); color: #9a96cc !important; }
-    .qa-btn--nudge.qa-active {
-        background: rgba(120,100,255,.16); color: #beb6ff !important;
-        border-color: rgba(120,100,255,.32);
-    }
-    /* green dot when a hint is saved */
+    .qa-btn--nudge:hover:not(:disabled) { background: rgba(255,255,255,.12); color: var(--qa-text) !important; }
+    .qa-btn--nudge.qa-active { background: rgba(132,112,255,.2); color: #d8d0ff !important; border-color: rgba(132,112,255,.34); }
     .qa-btn--nudge.qa-nudge-has-hint::after {
-        content: ""; position: absolute; top: 4px; right: 4px;
-        width: 6px; height: 6px; border-radius: 50%;
-        background: #42d898; box-shadow: 0 0 5px rgba(66,216,152,.6);
+        content: ""; position: absolute; top: 5px; right: 5px; width: 6px; height: 6px;
+        border-radius: 50%; background: var(--qa-ok); box-shadow: 0 0 5px rgba(70,227,160,.7);
     }
 
     /* ─ Nudge panel ─ */
     #qa-nudge-panel {
-        display: flex; flex-direction: column; gap: 5px;
-        background: rgba(255,255,255,.022); border: 1px solid rgba(120,100,255,.14);
-        border-radius: 13px; padding: 9px 10px;
-        animation: qa-appear .2s ease;
+        display: flex; flex-direction: column; gap: 7px;
+        background: var(--qa-surface); border: 1px solid var(--qa-border);
+        border-radius: 13px; padding: 10px; animation: qa-appear .2s ease;
     }
     #qa-nudge-input {
-        width: 100% !important;
-        background: rgba(120,100,255,.06) !important;
-        border: 1px solid rgba(120,100,255,.18) !important;
-        border-radius: 9px !important;
-        color: #ccc8ee !important; font-size: 12px !important;
-        font-family: inherit !important; padding: 8px 10px !important;
-        resize: none !important; line-height: 1.5 !important;
+        width: 100% !important; background: rgba(132,112,255,.08) !important;
+        border: 1px solid rgba(132,112,255,.22) !important; border-radius: 9px !important;
+        color: var(--qa-text) !important; font-size: 12.5px !important; font-family: inherit !important;
+        padding: 8px 10px !important; resize: none !important; line-height: 1.5 !important;
         outline: none !important; transition: border-color .15s, background .15s;
     }
-    #qa-nudge-input:focus {
-        border-color: rgba(120,100,255,.42) !important;
-        background: rgba(120,100,255,.1) !important;
-    }
-    #qa-nudge-input::placeholder { color: #38345a !important; font-style: italic; }
-    .qa-nudge-foot {
-        display: flex; align-items: center; gap: 5px;
-    }
-    .qa-nudge-meta {
-        flex: 1; font-size: 8.5px !important; color: #3c395e !important; font-style: italic;
-    }
+    #qa-nudge-input:focus { border-color: var(--qa-border-strong) !important; background: rgba(132,112,255,.12) !important; }
+    #qa-nudge-input::placeholder { color: var(--qa-text-faint) !important; }
+    .qa-nudge-foot { display: flex; align-items: center; gap: 6px; }
+    .qa-nudge-meta { flex: 1; font-size: 10px !important; color: var(--qa-text-faint) !important; }
     .qa-btn--nudge-clear {
-        background: rgba(255,255,255,.04); color: #5a5680 !important;
-        border: 1px solid rgba(255,255,255,.07);
-        padding: 4px 9px; border-radius: 7px; flex-shrink: 0;
-        font-size: 10.5px !important; font-weight: 600 !important;
-        cursor: pointer; transition: background .15s, color .15s;
+        background: rgba(255,255,255,.05); color: var(--qa-text-dim) !important;
+        border: 1px solid rgba(255,255,255,.1); padding: 5px 10px; border-radius: 7px; flex-shrink: 0;
+        font-size: 11px !important; font-weight: 600 !important; cursor: pointer; transition: background .15s, color .15s;
     }
-    .qa-btn--nudge-clear:hover { background: rgba(255,80,80,.1); color: #ff8080 !important; border-color: rgba(255,80,80,.2); }
+    .qa-btn--nudge-clear:hover { background: rgba(255,125,138,.14); color: var(--qa-err) !important; border-color: rgba(255,125,138,.3); }
     .qa-btn--nudge-submit {
-        background: linear-gradient(135deg, #4a38cc, #7553e0);
-        color: #fff !important; border: none;
-        padding: 4px 11px; border-radius: 7px; flex-shrink: 0;
-        font-size: 10.5px !important; font-weight: 700 !important;
-        cursor: pointer; transition: opacity .15s; letter-spacing: .2px;
-        box-shadow: 0 2px 8px rgba(74,56,204,.35);
+        background: linear-gradient(135deg, #5a44d6, #7d5ae6); color: #fff !important; border: none;
+        padding: 5px 12px; border-radius: 7px; flex-shrink: 0;
+        font-size: 11px !important; font-weight: 700 !important; cursor: pointer; transition: opacity .15s;
+        box-shadow: 0 2px 8px rgba(90,68,214,.4);
     }
-    .qa-btn--nudge-submit:hover { opacity: .84; }
+    .qa-btn--nudge-submit:hover { opacity: .88; }
 
     /* ─ Resize handle ─ */
-    #qa-resize {
-        position: absolute; bottom: 0; right: 0;
-        width: 22px; height: 22px;
-        cursor: nwse-resize; z-index: 10;
-        border-radius: 0 0 22px 0;
-    }
+    #qa-resize { position: absolute; bottom: 0; right: 0; width: 20px; height: 20px; cursor: nwse-resize; z-index: 10; }
     #qa-resize::after {
-        content: "";
-        position: absolute; right: 4px; bottom: 4px;
-        width: 9px; height: 9px;
-        background:
-            linear-gradient(-45deg,
-                rgba(120,100,255,.45) 0,    rgba(120,100,255,.45) 1.5px, transparent 1.5px, transparent 33%,
-                rgba(120,100,255,.45) 33%,  rgba(120,100,255,.45) calc(33% + 1.5px), transparent calc(33% + 1.5px), transparent 66%,
-                rgba(120,100,255,.45) 66%,  rgba(120,100,255,.45) calc(66% + 1.5px), transparent calc(66% + 1.5px));
-        transition: opacity .15s; opacity: .7;
+        content: ""; position: absolute; right: 5px; bottom: 5px; width: 7px; height: 7px;
+        border-right: 2px solid var(--qa-border-strong); border-bottom: 2px solid var(--qa-border-strong);
+        opacity: .7; transition: opacity .15s;
     }
-    #qa-resize:hover::after { opacity: 1; background:
-        linear-gradient(-45deg,
-            rgba(160,140,255,.9) 0,    rgba(160,140,255,.9) 1.5px, transparent 1.5px, transparent 33%,
-            rgba(160,140,255,.9) 33%,  rgba(160,140,255,.9) calc(33% + 1.5px), transparent calc(33% + 1.5px), transparent 66%,
-            rgba(160,140,255,.9) 66%,  rgba(160,140,255,.9) calc(66% + 1.5px), transparent calc(66% + 1.5px));
-    }
+    #qa-resize:hover::after { opacity: 1; }
     `;
 
     // ── Overlay HTML ───────────────────────────────────────────────────────────
@@ -677,12 +710,12 @@
     overlay.innerHTML = `
         <div id="qa-header">
             <span id="qa-title">✶ Sheja Asks<span id="qa-q-count" style="display:none"></span></span>
-            <span id="qa-status">Idle</span>
+            <span id="qa-status" role="status" aria-live="polite"><span class="qa-led"></span>Ready</span>
             <div id="qa-controls">
-                <button class="qa-icon-btn" id="qa-toggle" title="Show question &amp; options">Q</button>
-                <button class="qa-icon-btn" id="qa-pause" title="Pause auto-detection">⏸</button>
-                <button class="qa-icon-btn" id="qa-min" title="Minimize">─</button>
-                <button class="qa-icon-btn" id="qa-close" title="Close">×</button>
+                <button class="qa-icon-btn" id="qa-toggle" title="Show question & options" aria-label="Show question and options" aria-pressed="false">Q</button>
+                <button class="qa-icon-btn" id="qa-pause" title="Pause auto-detection" aria-label="Pause auto-detection">⏸</button>
+                <button class="qa-icon-btn" id="qa-min" title="Minimize" aria-label="Minimize">─</button>
+                <button class="qa-icon-btn" id="qa-close" title="Close" aria-label="Close">×</button>
             </div>
         </div>
         <div id="qa-content">
@@ -691,7 +724,7 @@
                     <span>Question</span>
                     <span id="qa-timestamp"></span>
                 </div>
-                <div id="qa-question">Waiting for question...</div>
+                <div id="qa-question">Waiting for a question…</div>
             </div>
             <div class="qa-section qa-hidden" id="qa-options-section">
                 <div class="qa-label">Options</div>
@@ -702,22 +735,22 @@
                     <span>✶ Answer</span>
                     <span class="qa-provider-badge" id="qa-provider-badge"></span>
                 </div>
-                <div id="qa-ai"><span class="qa-idle">Waiting for a question...</span></div>
+                <div id="qa-ai" role="status" aria-live="polite"><span class="qa-idle">Ready — waiting for a question.</span></div>
             </div>
             <div id="qa-footer">
-                <button id="qa-scan-main" class="qa-btn qa-btn--scan">Ask again</button>
-                <button id="qa-nudge-toggle" class="qa-btn qa-btn--nudge" title="Steer the AI with a context hint">💬</button>
+                <button id="qa-scan-main" class="qa-btn qa-btn--scan" title="Re-scan the page and ask the AI again">Re-ask AI</button>
+                <button id="qa-nudge-toggle" class="qa-btn qa-btn--nudge" title="Add a hint to steer the AI" aria-label="Add a hint to steer the AI">💬 Hint</button>
             </div>
             <div id="qa-nudge-panel" class="qa-hidden">
-                <textarea id="qa-nudge-input" rows="2" placeholder="Steer the AI — e.g. &quot;This quiz is about 20th century European history&quot;"></textarea>
+                <textarea id="qa-nudge-input" rows="2" aria-label="Context hint for the AI" placeholder="Steer the AI — e.g. &quot;1990s pop music&quot;"></textarea>
                 <div class="qa-nudge-foot">
-                    <span class="qa-nudge-meta">Sent with every call · Enter to submit</span>
+                    <span class="qa-nudge-meta">Sent with every question · Enter to submit</span>
                     <button id="qa-nudge-clear" class="qa-btn--nudge-clear">Clear</button>
                     <button id="qa-nudge-submit" class="qa-btn--nudge-submit">Submit ↵</button>
                 </div>
             </div>
         </div>
-        <div id="qa-resize" title="Drag to resize"></div>
+        <div id="qa-resize" title="Drag to resize" aria-hidden="true"></div>
     `;
 
     // ── Session persistence ────────────────────────────────────────────────────
@@ -765,24 +798,29 @@
         if (el) el.textContent = text;
     }
 
-    // Pipeline status pill: detecting → waiting → asking → answered → error.
+    // Pipeline status pill: ready → reading → waiting → thinking → answer ready → error.
     const _STATUS = {
-        detecting: { label: "Detecting…",  cls: "qa-s-busy" },
-        waiting:   { label: "Waiting…",    cls: "qa-s-busy" },
-        asking:    { label: "Asking AI…",  cls: "qa-s-busy" },
-        answered:  { label: "Answered ✓",  cls: "qa-s-ok"   },
-        error:     { label: "Error",       cls: "qa-s-err"  },
-        paused:    { label: "Paused",      cls: ""          },
-        idle:      { label: "Idle",        cls: ""          }
+        idle:      { label: "Ready",                cls: "qa-s-idle" },
+        detecting: { label: "Reading question…",    cls: "qa-s-busy" },
+        waiting:   { label: "Waiting for options…", cls: "qa-s-busy" },
+        asking:    { label: "Thinking…",            cls: "qa-s-busy" },
+        answered:  { label: "Answer ready",         cls: "qa-s-ok"   },
+        error:     { label: "Error",                cls: "qa-s-err"  },
+        paused:    { label: "Paused",               cls: "qa-s-warn" }
     };
     function setStatus(key) {
         const el = document.getElementById("qa-status");
         if (!el) return;
         const s = _STATUS[key] || _STATUS.idle;
-        el.textContent = s.label;
         el.className = s.cls || "";
-        const ansCard = document.querySelector(".qa-section--answer");
-        if (ansCard) ansCard.classList.toggle("qa-answered", key === "answered");
+        el.innerHTML = '<span class="qa-led"></span>';
+        el.appendChild(document.createTextNode(s.label));
+    }
+
+    // Drop the answer-card accent (used between states so a stale colour doesn't linger).
+    function clearAnswerState() {
+        const card = document.querySelector(".qa-section--answer");
+        if (card) card.classList.remove("qa-state-ok", "qa-state-warn", "qa-state-err");
     }
 
     // Fades #qa-ai out, rebuilds content via buildFn, fades back in.
@@ -806,22 +844,25 @@
 
     function showLoading(label) {
         setProviderBadge("");
+        clearAnswerState();
         fadeAiTo(el => {
             const wrap = document.createElement("div");
             wrap.className = "qa-loading";
+            const sp = document.createElement("div");
+            sp.className = "qa-spinner";
             const txt  = document.createElement("span");
-            txt.textContent = label || "Asking AI…";
-            const dots = document.createElement("div");
-            dots.className = "qa-dots";
-            dots.innerHTML = "<span></span><span></span><span></span>";
+            txt.textContent = label || "Thinking…";
+            wrap.appendChild(sp);
             wrap.appendChild(txt);
-            wrap.appendChild(dots);
             el.appendChild(wrap);
         });
     }
 
     function showError(msg) {
         setProviderBadge("");
+        clearAnswerState();
+        const card = document.querySelector(".qa-section--answer");
+        if (card) card.classList.add("qa-state-err");
         fadeAiTo(el => {
             const wrap = document.createElement("div");
             wrap.className = "qa-answer-wrap";
@@ -835,20 +876,28 @@
         });
     }
 
-    function showAnswer(answer, provider, isVisual, visualPending, autoFill, answerOptions) {
+    function showAnswer(answer, provider, isVisual, visualPending, autoFill, answerOptions, resolved) {
         const NAMES = { claude: "Claude", openai: "ChatGPT", gemini: "Gemini", mistral: "Mistral" };
         const optionsForAnswer = answerOptions || overlayAnswers;
 
-        const parsed   = parseAnswer(answer, optionsForAnswer);
+        const parsed   = resolved || parseAnswer(answer, optionsForAnswer);
         const fillText = parsed.fillText;
         const reason   = parsed.reason;
         const lowConfidence = parsed.lowConfidence;
+        const confidence = (parsed.confidence != null) ? parsed.confidence : null;
 
         // Single letter/digit choice (A–E, 1–9) → show as badge
         const choiceMatch = fillText.match(/^([A-Ea-e]|[1-9])\.?$/);
         const badge       = choiceMatch ? fillText.replace(".", "").toUpperCase() : null;
 
         setProviderBadge(isVisual ? (NAMES[provider] || provider) + " 📷" : (NAMES[provider] || provider));
+
+        // Answer card accent: green when confident, amber for a best guess.
+        const card = document.querySelector(".qa-section--answer");
+        if (card) {
+            card.classList.remove("qa-state-ok", "qa-state-warn", "qa-state-err");
+            card.classList.add(lowConfidence ? "qa-state-warn" : "qa-state-ok");
+        }
 
         fadeAiTo(el => {
             let filled = false;
@@ -886,10 +935,10 @@
                             setTimeout(autoSubmit, SUBMIT_INIT_MS);
                             return;
                         }
-                        if (++tries < 6) { setTimeout(tryClick, 200); return; }
+                        if (++tries < 8) { setTimeout(tryClick, 200); return; }
                         filled = false;
                         textEl.classList.remove("qa-filled");
-                        log("fill", { ans: fillText, method: "no_btn" });
+                        log("fill", { ans: fillText, method: "no_btn", tries });
                     })();
                     return;
                 }
@@ -928,20 +977,33 @@
                 + (fillText.length > 20 ? " qa-answer-text--sm" : "")
                 + (lowConfidence ? " qa-answer-text--guess" : "");
             textEl.textContent = badge ? (reason || fillText) : fillText;
-            if (visualPending) {
-                textEl.style.cursor = "default";
-                textEl.title = "Waiting for image scan…";
-            } else {
-                textEl.title = "Click to fill answer";
-                textEl.addEventListener("click", doFill);
-            }
+            // Keyboard-operable: Enter/Space selects the answer on the page, same as a click.
+            textEl.setAttribute("role", "button");
+            textEl.tabIndex = 0;
+            textEl.title = optionsForAnswer.length ? "Select this answer on the page" : "Type this answer into the page";
+            textEl.addEventListener("click", doFill);
+            textEl.addEventListener("keydown", e => {
+                if (e.key === "Enter" || e.key === " ") { e.preventDefault(); doFill(); }
+            });
             row.appendChild(textEl);
+
+            // Confidence chip — High / Likely / Best guess, with the model's percentage.
+            if (confidence != null) {
+                const chip = document.createElement("span");
+                const pct  = Math.round(confidence * 100);
+                let cls = "qa-chip--mid", word = "Likely";
+                if (confidence >= 0.85)      { cls = "qa-chip--ok";  word = "High"; }
+                else if (confidence < VOTE_CONF) { cls = "qa-chip--low"; word = "Best guess"; }
+                chip.className = "qa-chip " + cls;
+                chip.textContent = `${word} · ${pct}%`;
+                row.appendChild(chip);
+            }
             wrap.appendChild(row);
 
             if (lowConfidence) {
                 const g = document.createElement("div");
                 g.className = "qa-guess-note";
-                g.textContent = "⚠ best guess — verify before submitting";
+                g.textContent = "⚠ Best guess — verify before you submit.";
                 wrap.appendChild(g);
             }
 
@@ -955,19 +1017,12 @@
             if (!optionsForAnswer.length) {
                 const hint = document.createElement("div");
                 hint.className = "qa-hint";
-                hint.textContent = "📝 Open question — click answer to fill";
+                hint.textContent = "📝 Open-ended — click the answer to type it in.";
                 wrap.appendChild(hint);
             }
 
-            if (visualPending) {
-                const pend = document.createElement("div");
-                pend.className = "qa-visual-pending";
-                pend.textContent = "📷 Checking with screenshot...";
-                wrap.appendChild(pend);
-            }
-
             // Auto-fill only on manual rescan, not on auto-detected questions
-            if (autoFill && !visualPending) setTimeout(doFill, AUTOFILL_MS);
+            if (autoFill) setTimeout(doFill, AUTOFILL_MS);
 
             el.appendChild(wrap);
         });
@@ -1110,50 +1165,123 @@
     }
 
     // ── AI ──────────────────────────────────────────────────────────────────────
+    const VOTE_CONF    = 0.6;   // MC confidence below this triggers a self-consistency vote
+    const VOTE_SAMPLES = 2;     // extra samples drawn when voting
+    const VOTE_TEMP    = 0.4;   // temperature for vote samples (diversity)
+
+    // Low-level single request to the background; cb receives the normalized response.
+    function requestAI(q, ans, image, extra, cb) {
+        const nudgeEl = document.getElementById("qa-nudge-input");
+        const nudge   = (nudgeEl?.value || "").trim();
+        const msg = { action: "askAI", question: q, answers: ans };
+        if (image) msg.imageDataUrl = image;
+        if (nudge) msg.nudge = nudge;
+        if (extra?.strict) msg.strict = true;
+        if (typeof extra?.temperature === "number") msg.temperature = extra.temperature;
+        runtimeSend(msg, cb);
+    }
+
+    // Normalize a background response into { fillText, reason, lowConfidence, confidence, inRange }.
+    // Structured answers are trusted; parseAnswer is the fallback for free-text / parse failures.
+    function resolveResp(resp, ans) {
+        if (resp && resp.answer && resp.inRange !== false) {
+            const conf = (typeof resp.confidence === "number") ? resp.confidence : null;
+            return {
+                fillText: resp.answer,
+                reason: clampReason(resp.reasoning || ""),
+                lowConfidence: conf != null ? conf < VOTE_CONF : false,
+                confidence: conf,
+                inRange: true
+            };
+        }
+        const p = parseAnswer((resp && resp.raw) || (resp && resp.answer) || "", ans);
+        return {
+            fillText: p.fillText, reason: p.reason, lowConfidence: true,
+            confidence: (resp && typeof resp.confidence === "number") ? resp.confidence : null,
+            inRange: false
+        };
+    }
+
     function askAI(question, answers, imageDataUrl, autoFill, myId, strict) {
         if (myId === undefined) myId = ++reqId;   // direct callers (manual scan) get a fresh id
-        const q   = question;
-        const ans = answers || [];
+        const q    = question;
+        const ans  = answers || [];
+        const isMC = ans.length >= 2;
         setStatus("asking");
 
-        // Shared response handling: parse, optionally re-ask once on a confident MC miss.
+        const finish = (resolved, provider, usedImage) => {
+            if (myId !== reqId) return;
+            setStatus("answered");
+            showAnswer(null, provider, !!usedImage, false, autoFill, ans, resolved);
+        };
+
+        // Self-consistency vote — sample more times and majority-vote the option index.
+        const vote = (firstResp, usedImage) => {
+            const tally = {};
+            const record = r => {
+                const i = r && Number.isInteger(r.answerIndex) ? r.answerIndex : -1;
+                if (i >= 0) tally[i] = (tally[i] || 0) + 1;
+            };
+            record(firstResp);
+            let total = 1, pending = VOTE_SAMPLES;
+            const done = () => {
+                if (myId !== reqId) return;
+                let bestIdx = -1, bestCount = 0;
+                for (const k in tally) if (tally[k] > bestCount) { bestCount = tally[k]; bestIdx = +k; }
+                if (bestIdx >= 0) {
+                    finish({
+                        fillText: ans[bestIdx], reason: clampReason(firstResp.reasoning || ""),
+                        lowConfidence: bestCount <= total / 2, confidence: bestCount / total, inRange: true
+                    }, firstResp.provider, usedImage);
+                } else {
+                    finish(resolveResp(firstResp, ans), firstResp.provider, usedImage);
+                }
+            };
+            log("vote", { id: myId, samples: VOTE_SAMPLES });
+            for (let k = 0; k < VOTE_SAMPLES; k++) {
+                requestAI(q, ans, usedImage || null, { temperature: VOTE_TEMP }, r => {
+                    if (myId !== reqId) return;
+                    total++; record(r);
+                    if (--pending === 0) done();
+                });
+            }
+        };
+
         const handle = (resp, usedImage) => {
             if (myId !== reqId) return;
-            if (!resp?.answer) {
+            if (!resp || resp.error) {
                 log("err", { id: myId, error: resp?.error });
                 setStatus("error");
                 showError(resp?.error ?? "No response from AI");
                 return;
             }
-            log("resp", { id: myId, ans: resp.answer, prov: resp.provider });
-            // Bounded re-ask: an MC answer that matched no option → ask once more, strictly.
-            if (!strict && ans.length >= 2 && parseAnswer(resp.answer, ans).lowConfidence) {
+            log("resp", { id: myId, ans: resp.answer, idx: resp.answerIndex, conf: resp.confidence, prov: resp.provider });
+
+            // Off-list / unparseable on MC → one strict retry (deterministic, temp 0).
+            if (isMC && !strict && (resp.parseError || resp.inRange === false)) {
                 askAI(q, ans, usedImage || null, autoFill, myId, true);
                 return;
             }
-            setStatus("answered");
-            showAnswer(resp.answer, resp.provider, !!usedImage, false, autoFill, ans);
+            const resolved = resolveResp(resp, ans);
+            // Genuinely uncertain MC → vote to raise the hit rate.
+            if (isMC && resolved.inRange && resolved.confidence != null && resolved.confidence < VOTE_CONF) {
+                vote(resp, usedImage);
+                return;
+            }
+            finish(resolved, resp.provider, usedImage);
         };
 
-        const send = (image) => {
-            const nudgeEl = document.getElementById("qa-nudge-input");
-            const nudge   = (nudgeEl?.value || "").trim();
-            const msg = { action: "askAI", question: q, answers: ans };
-            if (strict) msg.strict = true;
-            if (image)  msg.imageDataUrl = image;
-            if (nudge)  msg.nudge = nudge;
-            runtimeSend(msg, resp => handle(resp, image));
-        };
+        const send = (image) => requestAI(q, ans, image, { strict }, resp => handle(resp, image));
 
         if (imageDataUrl) {                       // image already captured (manual scan / re-ask)
-            showLoading("Scanning image…");
+            showLoading("Reading the screenshot…");
             log("call", { id: myId, mode: "vision-direct" });
             send(imageDataUrl);
             return;
         }
 
         if (needsVision(q)) {
-            showLoading("Scanning image…");
+            showLoading("Reading the screenshot…");
             log("call", { id: myId, mode: "visual" });
             captureScreen((dataUrl, err) => {
                 if (myId !== reqId) return;
@@ -1192,7 +1320,7 @@
         const btn = document.getElementById("qa-toggle");
         qs?.classList.toggle("qa-hidden", !questionVisible);
         os?.classList.toggle("qa-hidden", !questionVisible);
-        if (btn) btn.classList.toggle("qa-on", questionVisible);
+        if (btn) { btn.classList.toggle("qa-on", questionVisible); btn.setAttribute("aria-pressed", String(questionVisible)); }
     }
 
     function mountOverlay() {
@@ -1209,9 +1337,8 @@
             const btn = document.getElementById("qa-pause");
             btn.textContent = isPaused ? "▶" : "⏸";
             btn.title = isPaused ? "Resume auto-detection" : "Pause auto-detection";
-            document.getElementById("qa-header").style.background = isPaused
-                ? "linear-gradient(135deg, #5b5b6e, #7c7c93)"
-                : "";
+            btn.setAttribute("aria-label", btn.title);
+            overlay.classList.toggle("qa-paused", isPaused);
             if (isPaused) { cancelPendingGate(); setStatus("paused"); }
             else setStatus("idle");
         });
@@ -1369,7 +1496,7 @@
         const tsEl = document.getElementById("qa-timestamp");
         const oEl  = document.getElementById("qa-options");
 
-        if (qEl)  qEl.textContent  = overlayQuestion || "Waiting for question...";
+        if (qEl)  qEl.textContent  = overlayQuestion || "Waiting for a question…";
         if (tsEl) tsEl.textContent = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
         if (oEl) {
@@ -1383,7 +1510,7 @@
             } else {
                 const li = document.createElement("li");
                 li.className = "qa-none";
-                li.textContent = "No options — open question";
+                li.textContent = "Open-ended — type your answer";
                 oEl.appendChild(li);
             }
         }
@@ -1438,6 +1565,7 @@
         if (myId !== reqId) return;
         pendingGateTimer = null;
         overlayAnswers = surface.answers;                 // now authoritative
+        captureAnswerEls();                               // snapshot live option nodes for click-time
         updateOverlay();
         log("question", { q: question, opts: overlayAnswers, kind: surface.kind, count: questionCount });
         askAI(question, overlayAnswers, null, false, myId);
