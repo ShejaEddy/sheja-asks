@@ -77,22 +77,40 @@ function httpError(status) {
     return `HTTP ${status}`;
 }
 
-// Dissect the question type and return a tailored hint so the model understands what's being asked.
+// Dissect the question type and return tailored hints so the model understands exactly
+// what's being asked. Hints ACCUMULATE — a "which is NOT the largest" question is both a
+// negation and a superlative, and small/fast models benefit from being told both. The
+// NEGATION hint comes first and loudest: missing a "NOT" is the single most common
+// small-model failure on multiple-choice quizzes.
 function questionTypeHint(q) {
     const l = q.toLowerCase();
+    const hints = [];
+    const isTrueFalse = l.includes("true or false");
+
+    if (!isTrueFalse && /\bnot\b|cannot|n['’]t\b|\bexcept\b|\bexcluding\b|\bnever\b|\bincorrect\b|\bnone of\b|odd one out/.test(l))
+        hints.push("- NEGATION: the question asks what is FALSE / does NOT fit / is the EXCEPTION — pick the option that BREAKS the pattern, not one that fits. Re-read the stem before choosing.");
     if (l.includes("unscramble") || l.includes("anagram") || l.includes("rearrange"))
-        return "\n- ANAGRAM: rearrange EXACTLY the scrambled letters into one real word — every letter used once, no extras. Count carefully: \"elcyeh\" = e,l,c,y,e,h (6 letters) -> lychee.";
+        hints.push("- ANAGRAM: rearrange EXACTLY the scrambled letters into one real word — every letter used once, no extras. Count carefully: \"elcyeh\" = e,l,c,y,e,h (6 letters) -> lychee.");
     if (l.startsWith("fill in") || l.startsWith("complete ") || l.includes("_____") || l.includes("____"))
-        return "\n- FILL-IN: give ONLY the missing word(s) that complete it, nothing else.";
-    if (l.startsWith("calculate") || l.startsWith("solve") || l.includes("how much") || /\bsum\b|\bproduct\b|\bequals\b/.test(l))
-        return "\n- MATH: compute step by step in reasoning; the answer is the final number only.";
+        hints.push("- FILL-IN: give ONLY the missing word(s) that complete it, nothing else.");
+    if (l.startsWith("calculate") || l.startsWith("solve") || l.includes("how much") || /\bsum\b|\bproduct\b|\bequals\b|\bconvert\b/.test(l))
+        hints.push("- MATH: compute step by step in reasoning; the answer is the final number/value only.");
     if (l.startsWith("how many") || l.startsWith("how much"))
-        return "\n- NUMERIC: the answer is the number only.";
+        hints.push("- NUMERIC: the answer is the number only.");
+    if (/\b(most|least|largest|smallest|biggest|highest|lowest|greatest|best|worst|longest|shortest|fastest|slowest|oldest|newest|closest|furthest)\b/.test(l))
+        hints.push("- SUPERLATIVE: compare ALL options against each other and pick the true extreme — don't stop at the first plausible one.");
+    if (/\barrange\b|\border\b|sequence|chronological|\brank\b|first to last/.test(l))
+        hints.push("- ORDERING: choose the option whose items are in the correct order/sequence.");
+    if (/\bmatch\b|matches|corresponds|goes with|paired with/.test(l))
+        hints.push("- MATCHING: pick the option that correctly pairs the items.");
+    if (/what year|which year|in what year|in which year|what date/.test(l))
+        hints.push("- YEAR/DATE: answer with the specific year/date.");
     if (l.startsWith("what is") || l.startsWith("what are") || l.startsWith("define") || l.startsWith("what does"))
-        return "\n- DEFINITION: the answer is the precise term or short fact only.";
-    if (l.startsWith("true or false") || l.includes("true or false"))
-        return "\n- TRUE/FALSE: the answer is exactly True or False.";
-    return "";
+        hints.push("- DEFINITION: the answer is the precise term or short fact only.");
+    if (isTrueFalse)
+        hints.push("- TRUE/FALSE: the answer is exactly True or False.");
+
+    return hints.length ? "\n" + hints.join("\n") : "";
 }
 
 // Builds the user prompt. Output FORMAT is enforced by structured-output schemas
@@ -121,6 +139,7 @@ ${numbered}
 Instructions:${typeHint}${strictNote}
 - Think briefly in "reasoning" before deciding.
 - Set "answer_index" to the number (0-${last}) of the ONE correct option. Pick exactly one — never two, never an option that is not listed.
+- If two options seem correct, choose the MOST specific and complete one.
 - Set "confidence" from 0 to 1 for how sure you are.
 
 Respond ONLY with JSON: {"reasoning": "...", "answer_index": <0-${last}>, "confidence": <0-1>}`;
@@ -352,4 +371,14 @@ async function callMistral(apiKey, question, answers, imageDataUrl, signal, opts
     const text = data.choices?.[0]?.message?.content;
     if (!text) throw new Error("Empty response from Mistral");
     return normalizeResult(text, answers);
+}
+
+// ── Test hook ──
+// Exposes prompt/parsing internals to a test harness. Inert in the service worker,
+// where `globalThis.__shejaBgTestHook` is never defined.
+if (typeof globalThis !== "undefined" && typeof globalThis.__shejaBgTestHook === "function") {
+    globalThis.__shejaBgTestHook({
+        buildPrompt, questionTypeHint, normalizeResult, genericSchema, geminiSchema,
+        httpError, base64, MODELS, MISTRAL_VISION_MODEL, MAX_TOKENS, SCREENSHOT_QUALITY
+    });
 }

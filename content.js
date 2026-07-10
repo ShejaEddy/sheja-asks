@@ -33,6 +33,8 @@
     const DEBOUNCE_Q_MS    = 120;   // faster flush for a "?"-terminated (complete) question
     const VISUAL_POLL_MS   = 250;   // rAF-throttled cadence for the visual/option loop
     const IMG_WAIT_MS      = 800;   // max wait for flag images to finish loading
+    const SCREENSHOT_SETTLE_MS = 40; // paint settle after hiding the overlay, before capture
+    const SCREENSHOT_POLL_MS   = 80; // re-check cadence while waiting for images to load
     const AUTOFILL_MS      = 700;   // delay before auto-fill on manual rescan
     const SUBMIT_INIT_MS   = 400;   // delay before first submit attempt (lets selection register)
     const SUBMIT_RETRY_MS  = 350;   // delay between submit retries
@@ -126,6 +128,9 @@
         return JUNK_PATTERNS.some(p => l.includes(p.toLowerCase()));
     }
 
+    // UI/navigation labels that are never quiz answers. Multi-word platform actions are
+    // safe to blanket-ignore; ambiguous single words (home/start/menu) are left out
+    // because they can be legitimate answers.
     const IGNORED_ANSWERS = new Set([
         "select one", "select one or more", "next", "back", "join", "play",
         "create", "kick players", "try", "try again", "submit", "check",
@@ -134,16 +139,34 @@
         "keep hosting", "stop hosting", "leave", "cancel",
         "editor", "generator", "hosting", "library",
         "hide incorrect answers", "show incorrect answers", "show correct answer",
-        "next question", "finish quiz", "finish", "skip", "continue"
+        "next question", "finish quiz", "finish", "skip", "continue",
+        // platform chrome / account / social actions
+        "log in", "login", "sign in", "sign up", "signup", "log out", "sign out",
+        "share", "report", "settings", "profile", "help",
+        "mute", "unmute", "fullscreen", "exit fullscreen", "got it",
+        "play again", "restart", "replay", "new game", "start over",
+        "reveal answer", "show hint", "give up", "close"
     ]);
 
+    // Question stems that appear WITHOUT a trailing "?" on quiz.com (imperatives,
+    // true/false, ordering, etc.). Kept strongly question-indicative to avoid detecting
+    // page chrome as a question — yes/no starters (is/are/do…) are deliberately excluded
+    // because those virtually always carry a "?" (already handled) and are otherwise a
+    // common false-positive source in body copy.
+    const _QUESTION_STEMS = [
+        "what ", "which ", "who ", "whom ", "whose ", "where ", "when ", "how ", "why ",
+        "name ", "find ", "identify ", "guess ", "choose ", "pick ", "select ",
+        "unscramble ", "spell ", "type ", "fill in", "complete ", "finish the",
+        "match ", "describe ", "define ", "explain ", "state ",
+        "calculate ", "solve ", "compute ", "evaluate ", "convert ", "round ", "estimate ",
+        "translate ", "arrange ", "order ", "put ", "sort ", "rank ", "list ", "count ",
+        "true or false", "in what", "in which", "at what", "on what", "by what",
+        "according to", "based on"
+    ];
     function looksLikeQuestion(text) {
         if (text.endsWith("?")) return true;
         const l = text.toLowerCase();
-        return ["what ", "which ", "who ", "where ", "when ", "how ", "why ",
-                "name ", "find ", "identify ", "guess ", "choose ",
-                "unscramble ", "spell ", "type ", "fill in", "complete ",
-                "match ", "select ", "describe ", "calculate ", "solve "].some(w => l.startsWith(w));
+        return _QUESTION_STEMS.some(w => l.startsWith(w));
     }
 
     // Quiz.com repeats the whole question (2×, 3×, sometimes with trailing score
@@ -198,19 +221,22 @@
 
     // Fingerprint the single largest, top-positioned question image by src.
     // Excludes small/decorative images and the overlay; src-only avoids dimension drift.
+    // PERF: single linear pass tracking the max — exactly one getBoundingClientRect per
+    // image. (The old filter+sort read the rect O(n log n) times, forcing layout on the
+    // hot visual-poll path that runs every ~250ms.)
     function visualFingerprint() {
-        const imgs = [...document.querySelectorAll("img")].filter(el => {
-            if (el.closest("#" + OVERLAY_ID)) return false;
+        let best = null, bestArea = 0;
+        const imgs = document.querySelectorAll("img");
+        for (const el of imgs) {
+            if (el.closest("#" + OVERLAY_ID)) continue;
             const r = el.getBoundingClientRect();
-            return r.width >= 150 && r.height >= 130 && inViewport(r, 10) &&
-                   (r.width / r.height) <= 2.5 && r.top >= 50 && r.top <= window.innerHeight * 0.85;
-        });
-        if (!imgs.length) return "";
-        imgs.sort((a, b) => {
-            const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
-            return (rb.width * rb.height) - (ra.width * ra.height);
-        });
-        return "img:" + (imgs[0].currentSrc || imgs[0].src);
+            if (r.width >= 150 && r.height >= 130 && inViewport(r, 10) &&
+                (r.width / r.height) <= 2.5 && r.top >= 50 && r.top <= window.innerHeight * 0.85) {
+                const area = r.width * r.height;
+                if (area > bestArea) { bestArea = area; best = el; }
+            }
+        }
+        return best ? "img:" + (best.currentSrc || best.src) : "";
     }
 
     function extractAnswers() {
@@ -297,11 +323,18 @@
                l.includes("logo") || l.includes("guess the");
     }
 
+    // Pure text/number tasks where any on-screen image is decorative — sending the
+    // (near-ubiquitous) background image to the model only hurts accuracy and costs a
+    // screenshot round-trip.
     function isImageIrrelevantQuestion(q) {
         const l = q.toLowerCase();
+        // NOTE: "calculate"/"solve" are deliberately NOT here — image-based geometry
+        // ("calculate the area of this triangle") genuinely needs vision. Plain
+        // arithmetic already stays text-only via the no-visual-cue path in needsVision().
         return l.includes("unscramble") || l.includes("anagram") || l.includes("rearrange") ||
                l.startsWith("fill in") || l.startsWith("complete the") ||
-               l.startsWith("type ") || l.startsWith("spell ");
+               l.startsWith("type ") || l.startsWith("spell ") ||
+               l.startsWith("convert ") || l.startsWith("round ");
     }
 
     const _VISUAL_CUES = ["this ", "these ", "shown", "pictured", "depicted", " above", " below",
@@ -486,28 +519,32 @@
         // Resolves { dataUrl, error }. Waits (up to IMG_WAIT_MS) for large images to
         // finish loading, hides the overlay so it isn't in the shot, then delegates
         // JPEG encoding to the background script.
+        //
+        // PERF: the common case (text/logo questions where the large images are already
+        // decoded) takes ONE image scan and fires after a single paint frame + settle —
+        // no polling. Only genuinely-loading images incur the ~80ms re-check loop, and
+        // the old redundant second requestAnimationFrame is gone (one frame is enough for
+        // the overlay-hide to paint), shaving a frame off every capture.
         capture() {
             return new Promise(resolve => {
                 this._hide();
                 const deadline = Date.now() + IMG_WAIT_MS;
+                const fire = () => setTimeout(() => {
+                    runtimeSend({ action: "takeScreenshot" }, resp => {
+                        this._show();
+                        resolve({ dataUrl: resp?.dataUrl || null, error: resp?.error || null });
+                    });
+                }, SCREENSHOT_SETTLE_MS);
                 const check = () => {
-                    const pending = [...document.querySelectorAll("img")].find(img => {
+                    const pending = [...document.querySelectorAll("img")].some(img => {
                         if (img.closest("#" + OVERLAY_ID) || img.complete) return false;
                         const r = img.getBoundingClientRect();
                         return r.width > 180 && r.height > 130 && inViewport(r, 10);
                     });
-                    if (!pending || Date.now() >= deadline) {
-                        requestAnimationFrame(() => setTimeout(() => {
-                            runtimeSend({ action: "takeScreenshot" }, resp => {
-                                this._show();
-                                resolve({ dataUrl: resp?.dataUrl || null, error: resp?.error || null });
-                            });
-                        }, 40));
-                    } else {
-                        setTimeout(check, 80);
-                    }
+                    if (!pending || Date.now() >= deadline) fire();
+                    else setTimeout(check, SCREENSHOT_POLL_MS);
                 };
-                requestAnimationFrame(check);
+                requestAnimationFrame(check);   // one frame so the hidden overlay paints
             });
         }
     }

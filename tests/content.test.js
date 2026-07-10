@@ -28,10 +28,13 @@ async function atest(name, fn) { try { await fn(); } catch (e) { rec(false, name
 
 // ── Fake DOM ──────────────────────────────────────────────────────────────────
 var DOM;
+var RECT_CALLS = 0;   // getBoundingClientRect calls (layout-forcing reads)
+var IMG_SCANS = 0;    // querySelectorAll('img') passes
 function resetDOM() {
     DOM = { buttons: [], imgs: [], inputs: [], loaders: [], textEls: [] };
     _elCache = {};
 }
+function resetCounters() { RECT_CALLS = 0; IMG_SCANS = 0; _rafs = 0; _timeouts = 0; }
 function R(o) { // rect factory with sensible visible defaults
     return Object.assign({ width: 120, height: 40, top: 100, left: 100, bottom: 140, right: 220 }, o || {});
 }
@@ -60,7 +63,7 @@ function mkEl(tag, opts) {
         removeChild() {}, remove() {},
         setAttribute() {}, getAttribute() { return null; },
         focus() {}, click() { this._clicked = true; }, scrollIntoView() {},
-        getBoundingClientRect() { return this._rect; },
+        getBoundingClientRect() { RECT_CALLS++; return this._rect; },
         closest(sel) {
             if (this._overlay && /qa-overlay/.test(sel)) return { id: 'qa-overlay' };
             if (opts.closest) return opts.closest(sel);
@@ -80,7 +83,7 @@ function qsa(sel) {
     var s = String(sel);
     if (/progressbar|loader|skeleton|spinner/.test(s)) return DOM.loaders;
     if (/input|textarea|contenteditable/.test(s)) return DOM.inputs;
-    if (/\bimg\b/.test(s)) return DOM.imgs;
+    if (/\bimg\b/.test(s)) { IMG_SCANS++; return DOM.imgs; }
     if (/button|role='button'|role='option'/.test(s)) return DOM.buttons;
     if (/h1|h2|h3/.test(s)) return DOM.textEls;
     return [];
@@ -636,6 +639,130 @@ await atest('orchestrator onFill suppresses re-detection', async () => {
     var ok1 = await app.onFill('Blue', true);
     ok('or6a', ok1);
     ok('or6b', app.ingestion._suppressed === 'Blue?\n', 'ingestion should suppress the answered fingerprint');
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// COVERAGE — improvements that let the extension handle more questions
+// ══════════════════════════════════════════════════════════════════════════════
+group('COVERAGE — question detection');
+test('detects imperative / true-false / ordering stems without a "?"', () => {
+    ok('cv1', A.looksLikeQuestion('True or false: the earth is flat'));
+    ok('cv2', A.looksLikeQuestion('Arrange the planets by size'));
+    ok('cv3', A.looksLikeQuestion('Convert 5 km to miles'));
+    ok('cv4', A.looksLikeQuestion('Define photosynthesis briefly'));
+    ok('cv5', A.looksLikeQuestion('In what year did WWII end'));
+    ok('cv6', A.looksLikeQuestion('Match the capital to its country'));
+    ok('cv7', A.looksLikeQuestion('Rank these rivers by length'));
+    ok('cv8', A.looksLikeQuestion('Whose theory is relativity'));
+});
+test('does NOT misfire on ordinary statements', () => {
+    ok('cv9', !A.looksLikeQuestion('This is just a statement about stuff'));
+    ok('cv10', !A.looksLikeQuestion('Do not press the button'));   // yes/no starters excluded on purpose
+    ok('cv11', !A.looksLikeQuestion('A knot in the rope'));         // "not\b" false-positive guard
+});
+group('COVERAGE — option/junk filtering');
+test('extractAnswers drops platform chrome (login/share/settings)', () => {
+    resetDOM();
+    DOM.buttons = [
+        mkEl('button', { text: 'Paris' }),
+        mkEl('button', { text: 'Log in' }),
+        mkEl('button', { text: 'Share' }),
+        mkEl('button', { text: 'Settings' }),
+        mkEl('button', { text: 'Play again' }),
+        mkEl('button', { text: 'Rome' })
+    ];
+    eq('cv12', A.extractAnswers(), ['Paris', 'Rome']);
+});
+group('COVERAGE — vision routing');
+test('convert/round are image-irrelevant (no wasted screenshot)', () => {
+    ok('cv13', A.isImageIrrelevantQuestion('Convert 10 to binary'));
+    ok('cv14', A.isImageIrrelevantQuestion('Round 3.7 to the nearest integer'));
+    ok('cv16', !A.needsVision('Convert 5 to hex'));
+    ok('cv17', !A.needsVision('Calculate 2 + 2'));                        // plain math → text-only
+    ok('cv18', A.needsVision('Calculate the area of the triangle shown')); // image geometry → vision
+    ok('cv19', !A.isImageIrrelevantQuestion('Calculate the area shown')); // calculate is NOT blanket-excluded
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PERFORMANCE — latency guards (fail if an optimization is reverted)
+// ══════════════════════════════════════════════════════════════════════════════
+group('PERFORMANCE — DOM read latency');
+test('visualFingerprint reads each image rect exactly once (no sort re-reads)', () => {
+    resetDOM();
+    DOM.imgs = [
+        Object.assign(mkEl('img', { rect: R({ width: 200, height: 180, top: 120, bottom: 300 }) }), { src: 'a.png', currentSrc: 'a.png' }),
+        Object.assign(mkEl('img', { rect: R({ width: 300, height: 200, top: 120, bottom: 320 }) }), { src: 'big.png', currentSrc: 'big.png' }),
+        mkEl('img', { rect: R({ width: 40, height: 40 }) }),
+        mkEl('img', { rect: R({ width: 160, height: 150, top: 120, bottom: 270 }) })
+    ];
+    resetCounters();
+    var fp = A.visualFingerprint();
+    eq('pf1a', fp, 'img:big.png');            // still picks the largest
+    eq('pf1b', RECT_CALLS, DOM.imgs.length);  // ≤1 layout-forcing read per image
+});
+await atest('screenshot fast path: one frame, one image scan, no polling', async () => {
+    installEnv();
+    DOM.imgs = [Object.assign(mkEl('img', { rect: R({ width: 300, height: 200 }) }), { complete: true })];
+    var cap = new A.CapturePipeline({ hide() {}, show() {} });
+    resetCounters();
+    var res = await cap.capture();
+    ok('pf2a', res.dataUrl && res.dataUrl.indexOf('data:image') === 0);
+    eq('pf2b', _rafs, 1);        // exactly one requestAnimationFrame (the redundant 2nd was removed)
+    eq('pf2c', IMG_SCANS, 1);    // single image scan; no ~80ms poll retries
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// DESIGN DECISIONS — lock in the architectural choices behind the rewrite
+// ══════════════════════════════════════════════════════════════════════════════
+group('DESIGN DECISIONS');
+test('DESIGN: needsVision is driven by wording, not image presence', () => {
+    // quiz.com shows a decorative background image on nearly every question, so image
+    // presence alone must NOT force a (slower, costlier, less accurate) vision call.
+    ok('dd1a', !A.needsVision('What is the capital of France'));
+    ok('dd1b', A.needsVision('Which flag is shown'));
+});
+test('DESIGN: question fingerprint excludes options ([] → [opts] is ONE question)', () => {
+    resetDOM(); DOM.buttons = [mkEl('button', { text: 'A' }), mkEl('button', { text: 'B' })];
+    var bus = busRec(); var eng = new A.IngestionEngine(bus);
+    eng._tryRecord('One stable question line?');
+    DOM.buttons = [mkEl('button', { text: 'C' }), mkEl('button', { text: 'D' })]; // options changed
+    eng._tryRecord('One stable question line?');                                   // same text → deduped
+    eq('dd2', bus._log.filter(x => x.e === 'questionDetected').length, 1);
+});
+await atest('DESIGN: MC never types into a text input (avoids the page search box)', async () => {
+    resetDOM();
+    var input = mkEl('input', { type: 'text', rect: R({ width: 200, height: 30 }) });
+    DOM.inputs = [input];              // an input exists, but NO option buttons
+    var f = new A.AnswerFiller(); f.capture();
+    var filled = await f.fill('SomeAnswer', true);   // isMC = true
+    ok('dd3a', filled === false);     // gives up rather than typing
+    eq('dd3b', input.value, '');      // the input was never touched
+});
+test('DESIGN: readiness gate biases to MC (bare input not "open" until grace)', () => {
+    resetDOM(); DOM.inputs = [mkEl('input', { type: 'text', rect: R({ width: 200, height: 30 }) })];
+    eq('dd4a', A.classifyAnswerSurface('What is x', 0).kind, 'none');
+    eq('dd4b', A.classifyAnswerSurface('What is x', A.constants.OPEN_GRACE_MS + 1).kind, 'open');
+});
+test('DESIGN: transition preserves in-flight solve; only an answer cancels it', () => {
+    installEnv();
+    var app = new A.Orchestrator(); app.start();
+    app._loading = true; var r0 = app.reqId;
+    app.onTransition({ type: 'layout' });
+    eq('dd5a', app.reqId, r0);        // transition = back-pressure, not eager cancel (no false-positive hang)
+    app.onReset({});
+    eq('dd5b', app.reqId, r0 + 1);    // a chosen answer supersedes the in-flight request
+});
+test('DESIGN: single-flight back-pressure (one reqId per detection)', () => {
+    installEnv();
+    CHROME.askAI = [
+        { answer: 'A', answerIndex: 0, inRange: true, confidence: 0.9, provider: 'gemini' },
+        { answer: 'A', answerIndex: 0, inRange: true, confidence: 0.9, provider: 'gemini' }
+    ];
+    var app = new A.Orchestrator(); app.start();
+    var r0 = app.reqId;
+    app.onQuestionDetected({ question: 'Q1?', options: ['A', 'B'], visualKey: '' });
+    app.onQuestionDetected({ question: 'Q2?', options: ['A', 'B'], visualKey: '' });
+    eq('dd6', app.reqId, r0 + 2);
 });
 
 } // end main()

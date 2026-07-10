@@ -69,19 +69,34 @@ wires them together with single-flight back-pressure.
 
 ## Testing
 
-The suite runs on macOS's built-in JavaScriptCore — no Node or install step. It
-stands up a fake DOM + `chrome` API, loads `content.js`, and exercises every pure
-helper plus each module's behaviour (question detection, readiness gate, vote,
-strict retry, vision routing, back-pressure, transition/reset lifecycle).
+Two suites run on macOS's built-in JavaScriptCore — no Node or install step. They
+stand up a fake DOM + `chrome` API, load the real scripts, and assert against their
+actual internals (~250 assertions total).
 
 ```sh
 # from the project root
-osascript -l JavaScript tests/content.test.js
+osascript -l JavaScript tests/content.test.js      # modules, helpers, latency, design
+osascript -l JavaScript tests/background.test.js   # AI prompts + response parsing
 ```
 
-Exits non-zero if any assertion fails (150+ assertions). `content.js` exposes its
-internals to the suite only when `globalThis.__shejaTestHook` is defined, which
-never happens in a real browser — so the test hook is inert in production.
+Both exit non-zero if any assertion fails. Coverage includes:
+
+- **Unit** — every pure helper (`parseAnswer`, `dedupeQuestion`, `truncateAtQuestionMark`,
+  `needsVision`, `extractAnswers`, `classifyAnswerSurface`, …).
+- **Behaviour** — each module: EventBus, Solver (vote / strict retry / vision routing),
+  AnswerFiller, IngestionEngine (gate + dedup + suppression), TransitionSensor,
+  EventLifecycleManager, Orchestrator.
+- **Design decisions** — locked in by name: fingerprint excludes options, `needsVision`
+  by wording not image presence, MC never types into an input, transition preserves the
+  in-flight solve (only an answer cancels), single-flight back-pressure.
+- **Performance guards** — fail if an optimization is reverted: `visualFingerprint` reads
+  each image's rect ≤ once, screenshot fast path uses one frame + one image scan.
+- **Prompt design** — which type-hints fire (negation, superlative, ordering, matching,
+  year, anagram, …) and that hints accumulate.
+
+The scripts expose their internals to the suites only when `globalThis.__shejaTestHook` /
+`__shejaBgTestHook` are defined — never true in a real browser, so the hooks are inert in
+production.
 
 ## Privacy
 
