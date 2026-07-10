@@ -1,45 +1,60 @@
+/**
+ * Sheja Asks — high-performance quiz-automation content script.
+ *
+ * Modular ES6 architecture (one class per concern), wired over a central EventBus:
+ *
+ *   IngestionEngine       DOM (MutationObserver + rAF batching) + visual-fingerprint
+ *                         polling; runs the answer-surface readiness gate and emits
+ *                         `questionDetected` once a question is answerable.
+ *   TransitionSensor      Predictive next-question detection (loaders/skeletons +
+ *                         layout-shift polling) → emits `transitionStart`.
+ *   EventLifecycleManager Capture-phase click interception → emits `lifecycleReset`
+ *                         the instant an answer is chosen.
+ *   CapturePipeline       Screenshot service (waits for large images, hides overlay,
+ *                         delegates to the background script).
+ *   Solver                AI request orchestration (vision routing, strict retry,
+ *                         self-consistency vote) against the existing background.js.
+ *   AnswerFiller          Click/type/submit the chosen answer on the page.
+ *   OverlayUI             The draggable/resizable overlay (view only).
+ *   Orchestrator          Owns state + back-pressure and wires every module together.
+ *
+ * Events: questionDetected {question,options,visualKey,timestamp}
+ *         transitionStart  {type,timestamp}
+ *         lifecycleReset   {timestamp}
+ * (plus internal ingest status pings for the overlay pill).
+ */
 (() => {
     'use strict';
 
     // ── Constants ──────────────────────────────────────────────────────────────
-    const LOG_KEY         = "__quiz_logs";
-    const MAX_LOGS        = 500;
-    const DEBOUNCE_MS     = 300;   // wait after last DOM change before recording question
-    const DEBOUNCE_Q_MS   = 120;   // shorter debounce for "?"-terminated (complete) questions
-    const POLL_MS         = 2500;  // interval to catch answer-only changes
-    const IMG_WAIT_MS     = 800;   // max wait for flag images to finish loading
-    const AUTOFILL_MS     = 700;   // delay before auto-fill on manual rescan
-    const SUBMIT_INIT_MS  = 400;   // delay before first submit attempt (lets quiz register selection)
-    const SUBMIT_RETRY_MS = 350;   // delay between submit retries
-    const SUBMIT_RETRIES  = 4;
-    const ANSWER_COOLDOWN = 4000; // ms to suppress re-detection after an answer is shown
+    const LOG_KEY          = "__quiz_logs";
+    const MAX_LOGS         = 500;
+    const DEBOUNCE_MS      = 300;   // settle time after last DOM change (incomplete stems)
+    const DEBOUNCE_Q_MS    = 120;   // faster flush for a "?"-terminated (complete) question
+    const VISUAL_POLL_MS   = 250;   // rAF-throttled cadence for the visual/option loop
+    const IMG_WAIT_MS      = 800;   // max wait for flag images to finish loading
+    const AUTOFILL_MS      = 700;   // delay before auto-fill on manual rescan
+    const SUBMIT_INIT_MS   = 400;   // delay before first submit attempt (lets selection register)
+    const SUBMIT_RETRY_MS  = 350;   // delay between submit retries
+    const SUBMIT_RETRIES   = 4;
+    const RESET_COOLDOWN_MS = 200;  // suppress re-detection immediately after an answer click
     // Answer-surface readiness gate — wait for options/input before calling the AI
-    const GATE_INTERVAL_MS = 150;  // re-check cadence while waiting for the answer surface
-    const GATE_MAX_MS      = 5000; // give up waiting and call best-effort after this
-    const OPEN_GRACE_MS    = 700;  // grace before treating a text input as "open-ended" (lets MC buttons render)
+    const GATE_INTERVAL_MS = 150;   // re-check cadence while waiting for the answer surface
+    const GATE_MAX_MS      = 5000;  // give up waiting and call best-effort after this
+    const OPEN_GRACE_MS    = 700;   // grace before treating a text input as "open-ended"
+    // TransitionSensor tuning
+    const TRANSITION_POLL_MS       = 50;   // layout-shift sampling cadence (spec: 50ms)
+    const LAYOUT_SHIFT_PX          = 50;   // dimension delta that counts as a transition
+    const TRANSITION_REFRACTORY_MS = 700;  // min gap between emitted transitions (anti-spam)
+    // Self-consistency voting
+    const VOTE_CONF    = 0.6;   // MC confidence below this triggers a vote
+    const VOTE_SAMPLES = 2;     // extra samples drawn when voting
+    const VOTE_TEMP    = 0.4;   // temperature for vote samples (diversity)
 
-    // ── State ──────────────────────────────────────────────────────────────────
-    let reqId           = 0;      // incremented on each question to discard stale responses
-    let lastFingerprint = "";     // question + answers joined — prevents duplicate triggers
-    let overlayQuestion = "";
-    let overlayAnswers  = [];
-    let overlayVisualKey = "";
-    let candidateQ      = "";     // best question candidate seen since last flush
-    let candidateTimer  = null;
-    let questionCount   = 0;
-    let questionVisible = false;
-    let isPaused        = false;  // when true, all auto-detection is suppressed
-    let lastAnswerAt    = 0;      // timestamp of last fill click — drives cooldown
-    let filledQuestion  = "";     // question text that was last filled — blocks re-scan until question changes
-    let pendingGateTimer = null;  // readiness-gate retry handle (cancelled when a new question arrives)
-    let isDragging      = false;
-    let dragX = 0, dragY = 0;
-    let isResizing      = false;
-    let resizeStartX = 0, resizeStartY = 0, resizeStartW = 0, resizeStartH = 0;
-    let _fadeTimer      = null;   // cancels in-flight fadeAiTo animation
-    let answerEls       = new Map(); // normKey(optionText) → live option element, captured when a question is dispatched
+    const OVERLAY_ID = "qa-overlay";
 
     // ── Logging ────────────────────────────────────────────────────────────────
+    // Ring buffer in sessionStorage — capped so it can never grow unbounded.
     let logSeq = 0;
     function log(type, data) {
         const entry = { ts: Date.now(), seq: ++logSeq, t: type, ...data };
@@ -51,10 +66,23 @@
         } catch (e) {}
     }
 
-    // ── Text utilities ─────────────────────────────────────────────────────────
-    function normalize(s) {
-        return s.replace(/\s+/g, " ").trim();
+    // ── Chrome messaging ─────────────────────────────────────────────────────────
+    function runtimeSend(msg, callback) {
+        try {
+            chrome.runtime.sendMessage(msg, response => {
+                if (chrome.runtime.lastError) callback({ error: "Extension context invalidated — reload the page" });
+                else callback(response);
+            });
+        } catch (e) {
+            callback({ error: String(e) });
+        }
     }
+
+    // ╔══════════════════════════════════════════════════════════════════════════╗
+    // ║ Shared pure utilities — stateless helpers consumed by every module.       ║
+    // ╚══════════════════════════════════════════════════════════════════════════╝
+
+    function normalize(s) { return s.replace(/\s+/g, " ").trim(); }
 
     // Canonical match key shared by answer capture and click-time resolution:
     // strip diacritics, lowercase, collapse punctuation/symbols/whitespace.
@@ -118,12 +146,9 @@
                 "match ", "select ", "describe ", "calculate ", "solve "].some(w => l.startsWith(w));
     }
 
-    // Strips repeated prefix — quiz.com repeats question text 2×, 3×, 4×, or more in the DOM.
-    // Loops until stable so 4× collapses to 2× then to 1× correctly.
     // Quiz.com repeats the whole question (2×, 3×, sometimes with trailing score
-    // garbage). Signature approach: find where the opening ~15 chars recur and cut
-    // there. Robustly collapses QQ / QQQ / partial repeats / repeat+garbage in one
-    // pass, and returns the text unchanged when there is no repeat.
+    // garbage). Find where the opening ~15 chars recur and cut there — collapses
+    // QQ / QQQ / partial repeats in one pass, returns unchanged when there's no repeat.
     function dedupeQuestion(text) {
         text = text.trim();
         const sigLen = Math.min(15, Math.floor(text.length / 2));
@@ -134,58 +159,48 @@
         return text;
     }
 
+    // Prefer the longer/more-complete candidate (riddles need full context).
     function isBetterCandidate(newC, oldC) {
         if (!oldC) return true;
         const nl = newC.toLowerCase(), ol = oldC.toLowerCase();
         const [longer, shorter] = nl.length >= ol.length ? [nl, ol] : [ol, nl];
-        // If one is a prefix of the other, prefer the longer (more complete) version
         if (longer.startsWith(shorter)) return newC.length > oldC.length;
-        // Otherwise prefer longer — riddles need full context
         return newC.length > oldC.length;
     }
 
-    function compact(s) {
-        return s.toLowerCase().replace(/\s+/g, "");
-    }
+    function compact(s) { return s.toLowerCase().replace(/\s+/g, ""); }
 
     function looksLikeOptionSuffix(after, answers) {
         if (!answers?.length) return false;
         const tail = compact(after);
-        const optionBits = answers
-            .map(a => compact(a))
-            .filter(a => a.length >= 2);
+        const optionBits = answers.map(a => compact(a)).filter(a => a.length >= 2);
         if (!optionBits.length) return false;
         const hits = optionBits.filter(a => tail.includes(a)).length;
         return hits >= Math.min(2, optionBits.length);
     }
 
-    // Only strips text after "?" when it looks like concatenated option labels.
-    // Riddle clues ("What am I? I get wetter the more I dry.") are preserved.
+    // Only strips text after "?" when it looks like concatenated option labels /
+    // score garbage. Riddle clues ("What am I? I get wetter the more I dry.") stay.
     function truncateAtQuestionMark(text, answers) {
         const idx = text.indexOf("?");
         if (idx === -1) return text;
         const head = text.slice(0, idx + 1);
         const after = text.slice(idx + 1).trim();
         if (!after) return text;
-        // No letters = score numbers / garbage — always truncate
-        if (!/[a-zA-Z]/.test(after)) return head;
-        // Tail restarts the question stem (e.g. "Q?Q…") — truncate
+        if (!/[a-zA-Z]/.test(after)) return head;                       // score numbers / garbage
         const headCore = compact(head).replace(/\?+$/, "");
         if (headCore.length >= 8 &&
             compact(after).startsWith(headCore.slice(0, Math.min(headCore.length, 14)))) return head;
-        // Repeated digit run from score animations ("008008008", "198519851985")
-        if (/(\d{2,4})\1{2,}/.test(after.replace(/\s+/g, ""))) return head;
-        // Otherwise keep riddle clue tails ("What am I? I get wetter the more I dry.")
+        if (/(\d{2,4})\1{2,}/.test(after.replace(/\s+/g, ""))) return head;   // repeated score run
         if (after.length > 8 && after.includes(" ") && !looksLikeOptionSuffix(after, answers)) return text;
         return head;
     }
 
-    // Fingerprint only the single largest, top-positioned question image by src.
-    // Excludes canvas + small images so score animations don't perturb the key
-    // (which would make the poll re-fire), and src-only avoids dimension drift.
+    // Fingerprint the single largest, top-positioned question image by src.
+    // Excludes small/decorative images and the overlay; src-only avoids dimension drift.
     function visualFingerprint() {
         const imgs = [...document.querySelectorAll("img")].filter(el => {
-            if (el.closest("#qa-overlay")) return false;
+            if (el.closest("#" + OVERLAY_ID)) return false;
             const r = el.getBoundingClientRect();
             return r.width >= 150 && r.height >= 130 && inViewport(r, 10) &&
                    (r.width / r.height) <= 2.5 && r.top >= 50 && r.top <= window.innerHeight * 0.85;
@@ -198,7 +213,6 @@
         return "img:" + (imgs[0].currentSrc || imgs[0].src);
     }
 
-    // ── DOM utilities ──────────────────────────────────────────────────────────
     function extractAnswers() {
         const seen = new Set();
         const results = [];
@@ -206,7 +220,7 @@
             const rect = el.getBoundingClientRect();
             const text = normalize(el.textContent || "");
             const skip =
-                el.closest("#qa-overlay") ? true :
+                el.closest("#" + OVERLAY_ID) ? true :
                 el.disabled              ? true :
                 rect.width < 60          ? true :
                 rect.height < 20         ? true :
@@ -221,20 +235,18 @@
         return results;
     }
 
-    // Non-interactive input types to skip
     const _SKIP_INPUT_TYPES = new Set(["submit","button","checkbox","radio","file","hidden","image","reset","range","color","date","datetime-local","month","week","time","number","password"]);
-
     function findTextInput() {
         const all = [...document.querySelectorAll("input, textarea, [contenteditable='true']")];
         return all.find(el => {
-            if (el.closest("#qa-overlay") || el.readOnly || el.disabled) return false;
+            if (el.closest("#" + OVERLAY_ID) || el.readOnly || el.disabled) return false;
             if (_SKIP_INPUT_TYPES.has((el.type || "").toLowerCase())) return false;
             const r = el.getBoundingClientRect();
             return r.width > 50 && r.height > 10 && inViewport(r);
         }) || null;
     }
 
-    // Uses React's internal setter so controlled inputs register the change
+    // Uses React's internal value setter so controlled inputs register the change.
     function fillInput(el, text) {
         el.focus();
         const proto  = el.tagName === "TEXTAREA" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
@@ -244,8 +256,8 @@
         el.dispatchEvent(new Event("change", { bubbles: true }));
     }
 
-    // Fires the full pointer + mouse sequence (so React handlers register) plus a native
-    // click() fallback, after bringing the element into view and focusing it.
+    // Full pointer+mouse sequence (so React handlers register) plus a native click()
+    // fallback, after bringing the element into view and focusing it.
     function simulateClick(el) {
         if (!el) return;
         try { el.scrollIntoView({ block: "center", inline: "center" }); } catch (e) {}
@@ -257,96 +269,25 @@
         ["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach(type =>
             el.dispatchEvent(new (type.startsWith("pointer") ? PointerEvent : MouseEvent)(type, opts))
         );
-        // quiz.com options are select-one (idempotent), so a second native click is safe and
-        // covers handlers that ignore synthetic events.
-        try { el.click(); } catch (e) {}
+        try { el.click(); } catch (e) {}   // quiz.com options are select-one → a 2nd click is safe
     }
 
-    // The clickable, on-screen option elements right now.
     function liveOptionEls() {
         return [...document.querySelectorAll("button, [role='button'], [role='option']")].filter(el => {
-            if (el.closest("#qa-overlay") || el.disabled) return false;
+            if (el.closest("#" + OVERLAY_ID) || el.disabled) return false;
             const r = el.getBoundingClientRect();
             return r.width >= 60 && r.height >= 20 && inViewport(r);
         });
     }
 
-    // The element that actually handles the click (a matched inner <span> isn't it).
     function clickableFrom(el) {
         return el?.closest("button, [role='button'], [role='option'], label, li[role]") || el;
     }
 
-    // Is a previously-captured option element still usable?
     function isLiveOption(el) {
-        if (!el || !el.isConnected || el.closest("#qa-overlay") || el.disabled) return false;
+        if (!el || !el.isConnected || el.closest("#" + OVERLAY_ID) || el.disabled) return false;
         const r = el.getBoundingClientRect();
         return r.width >= 40 && r.height >= 18 && inViewport(r, 4);
-    }
-
-    // Snapshot option text → element at the moment a question is dispatched, so click-time
-    // has the exact nodes that were on screen when the AI was asked.
-    function captureAnswerEls() {
-        answerEls = new Map();
-        liveOptionEls().forEach(el => {
-            const k = normKey(el.textContent || "");
-            if (k && !answerEls.has(k)) answerEls.set(k, el);
-        });
-    }
-
-    function clickAnswer(text) {
-        const want = normKey(text);
-        if (!want) return false;
-
-        // 1. The element captured at dispatch time, if it's still live (avoids the re-query race).
-        const stored = answerEls.get(want);
-        if (isLiveOption(stored)) { simulateClick(clickableFrom(stored)); return true; }
-
-        // 2. Re-resolve against the current DOM with the shared matcher.
-        const cands = liveOptionEls().map(el => ({ el, key: normKey(el.textContent || "") })).filter(c => c.key);
-        let m =
-            cands.find(c => c.key === want) ||                                           // exact
-            cands.find(c => c.key.startsWith(want)) ||                                    // option starts with answer
-            cands.find(c => want.startsWith(c.key) && c.key.length >= 4) ||               // answer starts with option
-            cands.find(c => c.key.includes(want) || want.includes(c.key));                // either contains the other
-        if (!m) {                                                                          // token overlap ≥ 0.6
-            let best = null, bestScore = 0.6;
-            for (const c of cands) { const s = tokenOverlap(c.key, want); if (s > bestScore) { bestScore = s; best = c; } }
-            m = best;
-        }
-
-        if (m) { simulateClick(clickableFrom(m.el)); return true; }
-        return false;
-    }
-
-    // Retries up to SUBMIT_RETRIES times — quiz.com sometimes takes a moment to enable the Try button
-    function autoSubmit(retries) {
-        if (retries === undefined) retries = SUBMIT_RETRIES;
-        const btn = [...document.querySelectorAll("button")].find(el => {
-            if (el.closest("#qa-overlay") || el.disabled) return false;
-            const r = el.getBoundingClientRect();
-            if (!inViewport(r)) return false;
-            const t = normalize(el.innerText || el.textContent || "").toLowerCase();
-            // Match "Try", "Try again", "Submit", "Submit answer", "Check", "Check answer"
-            return ["try", "submit", "check"].some(w => t === w || t.startsWith(w + " "));
-        });
-        if (btn) {
-            log("submit", { label: normalize(btn.textContent || "") });
-            simulateClick(btn);
-            return;
-        }
-        const input = findTextInput();
-        if (input) {
-            log("submit", { method: "enter" });
-            ["keydown", "keypress", "keyup"].forEach(type =>
-                input.dispatchEvent(new KeyboardEvent(type, {
-                    key: "Enter", code: "Enter", keyCode: 13, which: 13,
-                    bubbles: true, cancelable: true
-                }))
-            );
-            return;
-        }
-        if (retries > 0) setTimeout(() => autoSubmit(retries - 1), SUBMIT_RETRY_MS);
-        else log("submit", { method: "none" });
     }
 
     function looksLikeVisualQuestion(q) {
@@ -356,7 +297,6 @@
                l.includes("logo") || l.includes("guess the");
     }
 
-    // True for questions where any image on screen is decorative — sending it to AI hurts accuracy
     function isImageIrrelevantQuestion(q) {
         const l = q.toLowerCase();
         return l.includes("unscramble") || l.includes("anagram") || l.includes("rearrange") ||
@@ -364,13 +304,11 @@
                l.startsWith("type ") || l.startsWith("spell ");
     }
 
-    // Deictic / visual cues in the wording that mean the image actually matters.
     const _VISUAL_CUES = ["this ", "these ", "shown", "pictured", "depicted", " above", " below",
                           "hidden", "in the image", "in the picture", " map", "screenshot"];
 
-    // Decide whether to send a screenshot. Driven by the QUESTION WORDING, not the mere
-    // presence of a decorative image — quiz.com shows a background image on nearly every
-    // question, so image-presence alone would make almost everything use vision.
+    // Decide whether to send a screenshot — driven by QUESTION WORDING, not the mere
+    // presence of a decorative image (quiz.com shows a background image almost always).
     function needsVision(q) {
         if (isImageIrrelevantQuestion(q)) return false;
         const l = (q || "").toLowerCase();
@@ -378,12 +316,12 @@
         return _VISUAL_CUES.some(c => l.includes(c));
     }
 
-    // Scans visible DOM for a question when MutationObserver misses a transition
+    // Fallback whole-DOM scan for a question when the observer misses a transition.
     function scanForCurrentQuestion() {
         let best = "";
         const answers = extractAnswers();
         document.querySelectorAll("h1,h2,h3,h4,p,span,div,label").forEach(el => {
-            if (el.closest("#qa-overlay") || el.closest("button,[role='button']")) return;
+            if (el.closest("#" + OVERLAY_ID) || el.closest("button,[role='button']")) return;
             if (el.querySelectorAll("button,[role='button']").length > 0) return;
             const rect = el.getBoundingClientRect();
             if (rect.width < 80 || !inViewport(rect, 10)) return;
@@ -395,24 +333,1264 @@
         return best || null;
     }
 
-    // ── Chrome messaging ───────────────────────────────────────────────────────
-    function runtimeSend(msg, callback) {
-        try {
-            chrome.runtime.sendMessage(msg, response => {
-                if (chrome.runtime.lastError) {
-                    callback({ error: "Extension context invalidated — reload the page" });
-                } else {
-                    callback(response);
+    // What can we answer against right now? mc = option buttons, open = free-text input,
+    // none = nothing rendered yet. Biased toward MC: a bare text input only counts as
+    // "open" after a grace period so a lagging MC question isn't misread as open-ended.
+    function classifyAnswerSurface(question, elapsed) {
+        const btns = extractAnswers();
+        if (btns.length >= 2) return { kind: "mc", answers: btns };
+        if (isImageIrrelevantQuestion(question)) return { kind: "open", answers: [] };
+        if (findTextInput() && elapsed >= OPEN_GRACE_MS) return { kind: "open", answers: [] };
+        return { kind: "none", answers: [] };
+    }
+
+    // ── Answer-parsing helpers ──────────────────────────────────────────────────
+    function startsWithWord(text, prefix) {
+        if (!text.startsWith(prefix)) return false;
+        if (text.length === prefix.length) return true;
+        return !/[a-z0-9]/i.test(text.charAt(prefix.length));
+    }
+
+    function stripWrap(s) {
+        return (s || "")
+            .replace(/^\[(.+)\]$/, "$1")
+            .replace(/^["'“”‘’](.+)["'“”‘’]$/, "$1")
+            .trim();
+    }
+
+    function clampReason(r) {
+        r = (r || "").trim();
+        if (r.length > 120) r = r.slice(0, 117).trimEnd() + "…";
+        return r;
+    }
+
+    // Closest option by word overlap / substring — last resort when the model answers
+    // off-list, so the overlay still shows a real option (flagged low-confidence).
+    function closestOption(text, options) {
+        const t = text.toLowerCase();
+        const tWords = new Set(t.split(/[^a-z0-9]+/).filter(Boolean));
+        let best = null, bestScore = 0;
+        for (const opt of options) {
+            const o = opt.toLowerCase();
+            let score = 0;
+            for (const w of o.split(/[^a-z0-9]+/).filter(Boolean)) if (tWords.has(w)) score += 10;
+            if (t && (t.includes(o) || o.includes(t))) score += 5;
+            if (score > bestScore) { bestScore = score; best = opt; }
+        }
+        return bestScore > 0 ? best : null;
+    }
+
+    // Returns { fillText, reason, lowConfidence }. fillText is ALWAYS a clean answer:
+    // an exact option for MC, or 1-3 words for open-ended — never the reason blob.
+    function parseAnswer(answer, answerOptions) {
+        const rawText   = (answer || "").replace(/\r/g, "");
+        const lines     = rawText.split("\n").map(l => normalize(l)).filter(Boolean);
+        const text      = normalize(rawText);
+        const line1     = lines[0] || "";
+        const restLines = lines.slice(1).join(" ").trim();
+
+        if (answerOptions?.length) {                                   // ── multiple-choice ──
+            const options = [...answerOptions].sort((a, b) => b.length - a.length);
+            const cands   = [stripWrap(line1).toLowerCase(), line1.toLowerCase(), text.toLowerCase()];
+            const pick = (test) => {
+                for (const opt of options) {
+                    const o = opt.toLowerCase();
+                    if (!o) continue;
+                    for (const c of cands) if (test(c, o)) return opt;
                 }
+                return null;
+            };
+            let option =
+                pick((c, o) => c === o) ||
+                pick((c, o) => startsWithWord(c, o)) ||
+                pick((c, o) => {
+                    const i = c.indexOf(o);
+                    if (i === -1) return false;
+                    const before = i === 0 || !/[a-z0-9]/i.test(c.charAt(i - 1));
+                    return before && startsWithWord(c.slice(i), o);
+                });
+            let lowConfidence = false;
+            if (!option) { option = closestOption(text, options); lowConfidence = true; }
+            if (option) {
+                const o = option.toLowerCase();
+                let reason = "";
+                const src = line1.toLowerCase().startsWith(o) ? line1
+                          : text.toLowerCase().startsWith(o)  ? text : "";
+                if (src) {
+                    let rest = src.slice(option.length).trim().replace(/^[—–\-:.]\s*/, "").trim();
+                    if (rest.toLowerCase().startsWith(o))
+                        rest = rest.slice(option.length).trim().replace(/^[—–\-:.]\s*/, "").trim();
+                    reason = rest;
+                }
+                if (!reason && restLines && line1.toLowerCase() === o) reason = restLines;
+                return { fillText: option, reason: clampReason(reason), lowConfidence };
+            }
+            const fallback = stripWrap(line1 || text).split(/\s+/).slice(0, 4).join(" ");
+            return { fillText: fallback, reason: clampReason(restLines), lowConfidence: true };
+        }
+
+        if (lines.length >= 2) {                                       // ── open-ended ──
+            return { fillText: stripWrap(line1), reason: clampReason(restLines), lowConfidence: false };
+        }
+        const m = text.match(/^(.+?)\s+[—–-]\s+(.+)$/);
+        if (m) return { fillText: stripWrap(m[1].trim()), reason: clampReason(m[2].trim()), lowConfidence: false };
+        let fill = text;
+        const sentence = text.match(/^(.*?[.!?])(\s|$)/);
+        if (sentence && sentence[1].length <= 60) fill = sentence[1].replace(/[.!?]+$/, "").trim();
+        if (fill.split(/\s+/).length > 3) fill = fill.split(/\s+/).slice(0, 3).join(" ");
+        return { fillText: stripWrap(fill), reason: "", lowConfidence: false };
+    }
+
+    // Normalize a background response into { fillText, reason, lowConfidence, confidence, inRange }.
+    // Structured answers are trusted; parseAnswer is the fallback for free-text / parse failures.
+    function resolveResp(resp, ans) {
+        if (resp && resp.answer && resp.inRange !== false) {
+            const conf = (typeof resp.confidence === "number") ? resp.confidence : null;
+            return {
+                fillText: resp.answer,
+                reason: clampReason(resp.reasoning || ""),
+                lowConfidence: conf != null ? conf < VOTE_CONF : false,
+                confidence: conf,
+                inRange: true
+            };
+        }
+        const p = parseAnswer((resp && resp.raw) || (resp && resp.answer) || "", ans);
+        return {
+            fillText: p.fillText, reason: p.reason, lowConfidence: true,
+            confidence: (resp && typeof resp.confidence === "number") ? resp.confidence : null,
+            inRange: false
+        };
+    }
+
+    // ╔══════════════════════════════════════════════════════════════════════════╗
+    // ║ EventBus — minimal publish/subscribe hub connecting the modules.          ║
+    // ╚══════════════════════════════════════════════════════════════════════════╝
+    class EventBus {
+        constructor() { this._handlers = new Map(); }
+        on(evt, fn)  { (this._handlers.get(evt) || this._handlers.set(evt, new Set()).get(evt)).add(fn); return () => this.off(evt, fn); }
+        off(evt, fn) { this._handlers.get(evt)?.delete(fn); }
+        emit(evt, payload) {
+            const set = this._handlers.get(evt);
+            if (!set) return;
+            for (const fn of set) { try { fn(payload); } catch (e) { log("bus_err", { evt, error: String(e) }); } }
+        }
+        clear() { this._handlers.clear(); }
+    }
+
+    // ╔══════════════════════════════════════════════════════════════════════════╗
+    // ║ CapturePipeline — screenshot service.                                      ║
+    // ╚══════════════════════════════════════════════════════════════════════════╝
+    class CapturePipeline {
+        constructor({ hide, show }) { this._hide = hide; this._show = show; }
+
+        // Resolves { dataUrl, error }. Waits (up to IMG_WAIT_MS) for large images to
+        // finish loading, hides the overlay so it isn't in the shot, then delegates
+        // JPEG encoding to the background script.
+        capture() {
+            return new Promise(resolve => {
+                this._hide();
+                const deadline = Date.now() + IMG_WAIT_MS;
+                const check = () => {
+                    const pending = [...document.querySelectorAll("img")].find(img => {
+                        if (img.closest("#" + OVERLAY_ID) || img.complete) return false;
+                        const r = img.getBoundingClientRect();
+                        return r.width > 180 && r.height > 130 && inViewport(r, 10);
+                    });
+                    if (!pending || Date.now() >= deadline) {
+                        requestAnimationFrame(() => setTimeout(() => {
+                            runtimeSend({ action: "takeScreenshot" }, resp => {
+                                this._show();
+                                resolve({ dataUrl: resp?.dataUrl || null, error: resp?.error || null });
+                            });
+                        }, 40));
+                    } else {
+                        setTimeout(check, 80);
+                    }
+                };
+                requestAnimationFrame(check);
             });
-        } catch (e) {
-            callback({ error: String(e) });
         }
     }
 
-    // ── Styles ─────────────────────────────────────────────────────────────────
-    const overlayStyle = document.createElement("style");
-    overlayStyle.textContent = `
+    // ╔══════════════════════════════════════════════════════════════════════════╗
+    // ║ Solver — AI request orchestration against background.js.                   ║
+    // ╚══════════════════════════════════════════════════════════════════════════╝
+    class Solver {
+        constructor({ capture, getNudge }) { this._capture = capture; this._getNudge = getNudge; }
+
+        // Single background round-trip. Promise resolves with the normalized response.
+        _ask(q, ans, image, { strict, temperature } = {}) {
+            return new Promise(resolve => {
+                const msg = { action: "askAI", question: q, answers: ans };
+                if (image) msg.imageDataUrl = image;
+                const nudge = (this._getNudge() || "").trim();
+                if (nudge) msg.nudge = nudge;
+                if (strict) msg.strict = true;
+                if (typeof temperature === "number") msg.temperature = temperature;
+                runtimeSend(msg, resolve);
+            });
+        }
+
+        // Full solve. Returns { resolved, provider, usedImage } or null when superseded.
+        // imageDataUrl bypasses vision routing (manual scan / re-ask already have a shot).
+        async solve(q, ans, { imageDataUrl = null, onProgress = () => {}, isStale = () => false } = {}) {
+            const isMC = ans.length >= 2;
+            let image = imageDataUrl;
+
+            if (!image && needsVision(q)) {
+                onProgress("screenshot");
+                const shot = await this._capture.capture();
+                if (isStale()) return null;
+                image = shot.dataUrl || null;   // null → best-effort text-only
+            }
+
+            onProgress(image ? "asking-vision" : "asking");
+            log("call", { mode: image ? "vision" : "text" });
+            let resp = await this._ask(q, ans, image);
+            if (isStale()) return null;
+            if (!resp || resp.error) throw new Error(resp?.error || "No response from AI");
+            log("resp", { ans: resp.answer, idx: resp.answerIndex, conf: resp.confidence, prov: resp.provider });
+
+            // Off-list / unparseable on MC → one strict, deterministic retry.
+            if (isMC && (resp.parseError || resp.inRange === false)) {
+                onProgress("strict");
+                const r2 = await this._ask(q, ans, image, { strict: true });
+                if (isStale()) return null;
+                if (r2 && !r2.error) resp = r2;
+            }
+
+            let resolved = resolveResp(resp, ans);
+
+            // Genuinely uncertain MC → self-consistency vote to raise the hit rate.
+            if (isMC && resolved.inRange && resolved.confidence != null && resolved.confidence < VOTE_CONF) {
+                onProgress("voting");
+                const voted = await this._vote(q, ans, image, resp, isStale);
+                if (isStale()) return null;
+                if (voted) resolved = voted;
+            }
+
+            return { resolved, provider: resp.provider, usedImage: !!image };
+        }
+
+        // Draw extra samples at higher temperature and majority-vote the option index.
+        async _vote(q, ans, image, firstResp, isStale) {
+            log("vote", { samples: VOTE_SAMPLES });
+            const tally = {};
+            const record = r => {
+                const i = r && Number.isInteger(r.answerIndex) ? r.answerIndex : -1;
+                if (i >= 0) tally[i] = (tally[i] || 0) + 1;
+            };
+            record(firstResp);
+            const extra = await Promise.all(
+                Array.from({ length: VOTE_SAMPLES }, () => this._ask(q, ans, image, { temperature: VOTE_TEMP }))
+            );
+            if (isStale()) return null;
+            let total = 1;
+            for (const r of extra) { total++; if (r && !r.error) record(r); }
+            let bestIdx = -1, bestCount = 0;
+            for (const k in tally) if (tally[k] > bestCount) { bestCount = tally[k]; bestIdx = +k; }
+            if (bestIdx < 0) return null;
+            return {
+                fillText: ans[bestIdx],
+                reason: clampReason(firstResp.reasoning || ""),
+                lowConfidence: bestCount <= total / 2,
+                confidence: bestCount / total,
+                inRange: true
+            };
+        }
+    }
+
+    // ╔══════════════════════════════════════════════════════════════════════════╗
+    // ║ AnswerFiller — applies the chosen answer to the page.                      ║
+    // ╚══════════════════════════════════════════════════════════════════════════╝
+    class AnswerFiller {
+        constructor() { this._answerEls = new Map(); }   // normKey(optionText) → live element
+
+        // Snapshot option text → element at dispatch time, so click-time uses the exact
+        // nodes that were on screen when the AI was asked (avoids a re-query race).
+        capture() {
+            this._answerEls = new Map();
+            liveOptionEls().forEach(el => {
+                const k = normKey(el.textContent || "");
+                if (k && !this._answerEls.has(k)) this._answerEls.set(k, el);
+            });
+        }
+
+        clickAnswer(text) {
+            const want = normKey(text);
+            if (!want) return false;
+            const stored = this._answerEls.get(want);
+            if (isLiveOption(stored)) { simulateClick(clickableFrom(stored)); return true; }
+
+            const cands = liveOptionEls().map(el => ({ el, key: normKey(el.textContent || "") })).filter(c => c.key);
+            let m =
+                cands.find(c => c.key === want) ||
+                cands.find(c => c.key.startsWith(want)) ||
+                cands.find(c => want.startsWith(c.key) && c.key.length >= 4) ||
+                cands.find(c => c.key.includes(want) || want.includes(c.key));
+            if (!m) {
+                let best = null, bestScore = 0.6;
+                for (const c of cands) { const s = tokenOverlap(c.key, want); if (s > bestScore) { bestScore = s; best = c; } }
+                m = best;
+            }
+            if (m) { simulateClick(clickableFrom(m.el)); return true; }
+            return false;
+        }
+
+        // Multi-strategy click: exact → no leading article → no punctuation.
+        _attemptClick(t) {
+            if (this.clickAnswer(t)) return true;
+            const noArticle = t.replace(/^(the|a|an)\s+/i, "").trim();
+            if (noArticle !== t && this.clickAnswer(noArticle)) return true;
+            const noPunct = t.replace(/[.,!?;:'"()]/g, "").trim();
+            if (noPunct !== t && this.clickAnswer(noPunct)) return true;
+            return false;
+        }
+
+        // Apply an answer. Promise resolves true on success. MC only ever clicks an
+        // option (retries while buttons render, never types into a page search box);
+        // open-ended types into the input, falling back to a button.
+        fill(fillText, isMC) {
+            return new Promise(resolve => {
+                if (isMC) {
+                    let tries = 0;
+                    const tryClick = () => {
+                        if (this._attemptClick(fillText)) {
+                            log("fill", { ans: fillText, method: "click_btn" });
+                            setTimeout(() => this.autoSubmit(), SUBMIT_INIT_MS);
+                            resolve(true); return;
+                        }
+                        if (++tries < 8) { setTimeout(tryClick, 200); return; }
+                        log("fill", { ans: fillText, method: "no_btn", tries });
+                        resolve(false);
+                    };
+                    tryClick();
+                    return;
+                }
+                const input = findTextInput();
+                if (input) {
+                    log("fill", { ans: fillText, method: "fill_input" });
+                    fillInput(input, fillText);
+                    setTimeout(() => this.autoSubmit(), 60);
+                    resolve(true);
+                } else if (this._attemptClick(fillText)) {
+                    log("fill", { ans: fillText, method: "click_btn" });
+                    setTimeout(() => this.autoSubmit(), SUBMIT_INIT_MS);
+                    resolve(true);
+                } else {
+                    log("fill", { ans: fillText, method: "no_target" });
+                    resolve(false);
+                }
+            });
+        }
+
+        // Retries — quiz.com sometimes takes a moment to enable the Try/Submit button.
+        autoSubmit(retries) {
+            if (retries === undefined) retries = SUBMIT_RETRIES;
+            const btn = [...document.querySelectorAll("button")].find(el => {
+                if (el.closest("#" + OVERLAY_ID) || el.disabled) return false;
+                if (!inViewport(el.getBoundingClientRect())) return false;
+                const t = normalize(el.innerText || el.textContent || "").toLowerCase();
+                return ["try", "submit", "check"].some(w => t === w || t.startsWith(w + " "));
+            });
+            if (btn) { log("submit", { label: normalize(btn.textContent || "") }); simulateClick(btn); return; }
+            const input = findTextInput();
+            if (input) {
+                log("submit", { method: "enter" });
+                ["keydown", "keypress", "keyup"].forEach(type =>
+                    input.dispatchEvent(new KeyboardEvent(type, {
+                        key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true
+                    }))
+                );
+                return;
+            }
+            if (retries > 0) setTimeout(() => this.autoSubmit(retries - 1), SUBMIT_RETRY_MS);
+            else log("submit", { method: "none" });
+        }
+    }
+
+    // ╔══════════════════════════════════════════════════════════════════════════╗
+    // ║ OverlayUI — the view (draggable/resizable overlay). No detection logic.    ║
+    // ╚══════════════════════════════════════════════════════════════════════════╝
+    const _STATUS = {
+        idle:      { label: "Ready",                cls: "qa-s-idle" },
+        detecting: { label: "Reading question…",    cls: "qa-s-busy" },
+        waiting:   { label: "Waiting for options…", cls: "qa-s-busy" },
+        asking:    { label: "Thinking…",            cls: "qa-s-busy" },
+        answered:  { label: "Answer ready",         cls: "qa-s-ok"   },
+        error:     { label: "Error",                cls: "qa-s-err"  },
+        paused:    { label: "Paused",               cls: "qa-s-warn" }
+    };
+
+    class OverlayUI {
+        constructor(handlers) {
+            this.handlers = handlers;                 // { onClose, onPauseToggle, onRescan, onNudgeSubmit, onFill }
+            this._questionVisible = false;
+            this._fadeTimer = null;
+            this._filling = false;
+            this._isDragging = false; this._dragX = 0; this._dragY = 0;
+            this._isResizing = false; this._rsX = 0; this._rsY = 0; this._rsW = 0; this._rsH = 0;
+            this._style = null; this.overlay = null;
+            this._onMouseMove = this._onMouseMove.bind(this);
+            this._onMouseUp   = this._onMouseUp.bind(this);
+        }
+
+        get isResizing() { return this._isResizing; }
+
+        // ── Mount / teardown ──
+        mount() {
+            if (!document.body) { setTimeout(() => this.mount(), 200); return; }
+            if (this.overlay && document.body.contains(this.overlay)) return;
+            this._injectStyle();
+            this._build();
+            document.body.appendChild(this.overlay);
+            this._restore();
+            this._wireControls();
+            document.addEventListener("mousemove", this._onMouseMove);
+            document.addEventListener("mouseup", this._onMouseUp);
+        }
+
+        destroy() {
+            document.removeEventListener("mousemove", this._onMouseMove);
+            document.removeEventListener("mouseup", this._onMouseUp);
+            this.overlay?.remove();
+            this._style?.remove();
+            this.overlay = null;
+        }
+
+        _injectStyle() {
+            if (this._style) return;
+            this._style = document.createElement("style");
+            this._style.textContent = OVERLAY_CSS;
+            (document.head || document.documentElement).appendChild(this._style);
+        }
+
+        _build() {
+            this.overlay = document.createElement("div");
+            this.overlay.id = OVERLAY_ID;
+            this.overlay.innerHTML = OVERLAY_HTML;
+        }
+
+        // ── Status / provider ──
+        setStatus(key) {
+            const el = document.getElementById("qa-status");
+            if (!el) return;
+            const s = _STATUS[key] || _STATUS.idle;
+            el.className = s.cls || "";
+            el.innerHTML = '<span class="qa-led"></span>';
+            el.appendChild(document.createTextNode(s.label));
+        }
+        setProviderBadge(text) {
+            const el = document.getElementById("qa-provider-badge");
+            if (el) el.textContent = text;
+        }
+        clearAnswerAccent() {
+            const card = document.querySelector(".qa-section--answer");
+            if (card) card.classList.remove("qa-state-ok", "qa-state-warn", "qa-state-err");
+        }
+        setPausedVisual(paused) { this.overlay?.classList.toggle("qa-paused", paused); }
+        setHidden(hidden) { if (this.overlay) this.overlay.style.visibility = hidden ? "hidden" : ""; }
+
+        // Fades #qa-ai out, rebuilds via buildFn, fades in. Cancels any pending fade so a
+        // stale question can't overwrite a newer one.
+        _fadeAiTo(buildFn) {
+            const el = document.getElementById("qa-ai");
+            if (!el) return;
+            if (this._fadeTimer) { clearTimeout(this._fadeTimer); this._fadeTimer = null; }
+            el.style.opacity = "0"; el.style.transform = "translateY(4px)";
+            this._fadeTimer = setTimeout(() => {
+                this._fadeTimer = null;
+                el.innerHTML = "";
+                buildFn(el);
+                requestAnimationFrame(() => { el.style.opacity = "1"; el.style.transform = "translateY(0)"; });
+            }, 90);
+        }
+
+        showLoading(label) {
+            this.setProviderBadge("");
+            this.clearAnswerAccent();
+            this._fadeAiTo(el => {
+                const wrap = document.createElement("div"); wrap.className = "qa-loading";
+                const sp = document.createElement("div"); sp.className = "qa-spinner";
+                const txt = document.createElement("span"); txt.textContent = label || "Thinking…";
+                wrap.appendChild(sp); wrap.appendChild(txt); el.appendChild(wrap);
+            });
+        }
+
+        showError(msg) {
+            this.setProviderBadge("");
+            this.clearAnswerAccent();
+            document.querySelector(".qa-section--answer")?.classList.add("qa-state-err");
+            this._fadeAiTo(el => {
+                const wrap = document.createElement("div"); wrap.className = "qa-answer-wrap";
+                const err = document.createElement("div"); err.className = "qa-error";
+                err.textContent = "⚠ " + msg;
+                wrap.appendChild(err); el.appendChild(wrap);
+            });
+        }
+
+        // Neutral resting state — used to clear a spinner when a solve is abandoned.
+        showIdle(msg) {
+            this.setProviderBadge("");
+            this.clearAnswerAccent();
+            this._fadeAiTo(el => {
+                const span = document.createElement("span");
+                span.className = "qa-idle";
+                span.textContent = msg || "Ready — waiting for a question.";
+                el.appendChild(span);
+            });
+        }
+
+        // Render the question + options panels and pulse the answer card.
+        renderQuestion(question, options, count) {
+            this.mount();
+            this.closeNudgePanel();
+            this._filling = false;
+
+            const qEl = document.getElementById("qa-question");
+            const tsEl = document.getElementById("qa-timestamp");
+            const oEl = document.getElementById("qa-options");
+            if (qEl)  qEl.textContent = question || "Waiting for a question…";
+            if (tsEl) tsEl.textContent = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+            if (oEl) {
+                oEl.innerHTML = "";
+                if (options.length) {
+                    options.forEach(a => { const li = document.createElement("li"); li.textContent = a; oEl.appendChild(li); });
+                } else {
+                    const li = document.createElement("li"); li.className = "qa-none";
+                    li.textContent = "Open-ended — type your answer"; oEl.appendChild(li);
+                }
+            }
+            this._applyQuestionVisibility();
+
+            const ansEl = this.overlay.querySelector(".qa-section--answer");
+            if (ansEl) { ansEl.classList.remove("qa-pulse"); requestAnimationFrame(() => ansEl.classList.add("qa-pulse")); }
+
+            const cntEl = document.getElementById("qa-q-count");
+            if (cntEl) { cntEl.style.display = count > 0 ? "" : "none"; cntEl.textContent = `#${count}`; }
+        }
+
+        // Present a resolved answer. `autoFill` clicks it automatically after a delay
+        // (manual rescan); otherwise the user clicks the answer text to apply it.
+        showAnswer(resolved, provider, usedImage, autoFill, options) {
+            const NAMES = { claude: "Claude", openai: "ChatGPT", gemini: "Gemini", mistral: "Mistral" };
+            const { fillText, reason, lowConfidence, confidence } = resolved;
+            const isMC = options.length >= 2;
+
+            const choiceMatch = (fillText || "").match(/^([A-Ea-e]|[1-9])\.?$/);
+            const badge = choiceMatch ? fillText.replace(".", "").toUpperCase() : null;
+
+            this.setProviderBadge(usedImage ? (NAMES[provider] || provider) + " 📷" : (NAMES[provider] || provider));
+
+            const card = document.querySelector(".qa-section--answer");
+            if (card) {
+                card.classList.remove("qa-state-ok", "qa-state-warn", "qa-state-err");
+                card.classList.add(lowConfidence ? "qa-state-warn" : "qa-state-ok");
+            }
+
+            this._fadeAiTo(el => {
+                const wrap = document.createElement("div"); wrap.className = "qa-answer-wrap";
+                const row = document.createElement("div"); row.className = "qa-answer-row";
+
+                if (badge) {
+                    const b = document.createElement("span"); b.className = "qa-badge"; b.textContent = badge; row.appendChild(b);
+                }
+
+                const textEl = document.createElement("span");
+                textEl.className = "qa-answer-text"
+                    + (fillText.length > 20 ? " qa-answer-text--sm" : "")
+                    + (lowConfidence ? " qa-answer-text--guess" : "");
+                textEl.textContent = badge ? (reason || fillText) : fillText;
+                textEl.setAttribute("role", "button");
+                textEl.tabIndex = 0;
+                textEl.title = options.length ? "Select this answer on the page" : "Type this answer into the page";
+                const requestFill = () => this._requestFill(textEl, fillText, isMC);
+                textEl.addEventListener("click", requestFill);
+                textEl.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); requestFill(); } });
+                row.appendChild(textEl);
+
+                if (confidence != null) {
+                    const chip = document.createElement("span");
+                    const pct = Math.round(confidence * 100);
+                    let cls = "qa-chip--mid", word = "Likely";
+                    if (confidence >= 0.85)          { cls = "qa-chip--ok";  word = "High"; }
+                    else if (confidence < VOTE_CONF) { cls = "qa-chip--low"; word = "Best guess"; }
+                    chip.className = "qa-chip " + cls;
+                    chip.textContent = `${word} · ${pct}%`;
+                    row.appendChild(chip);
+                }
+                wrap.appendChild(row);
+
+                if (lowConfidence) {
+                    const g = document.createElement("div"); g.className = "qa-guess-note";
+                    g.textContent = "⚠ Best guess — verify before you submit."; wrap.appendChild(g);
+                }
+                if (reason && !badge) {
+                    const r = document.createElement("div"); r.className = "qa-reason"; r.textContent = reason; wrap.appendChild(r);
+                }
+                if (!options.length) {
+                    const h = document.createElement("div"); h.className = "qa-hint";
+                    h.textContent = "📝 Open-ended — click the answer to type it in."; wrap.appendChild(h);
+                }
+
+                if (autoFill) setTimeout(requestFill, AUTOFILL_MS);
+                el.appendChild(wrap);
+            });
+        }
+
+        // Route a fill request through the controller; strike the answer through on success.
+        _requestFill(textEl, fillText, isMC) {
+            if (this._filling) return;
+            this._filling = true;
+            Promise.resolve(this.handlers.onFill(fillText, isMC)).then(ok => {
+                this._filling = false;
+                if (ok) textEl.classList.add("qa-filled");
+            });
+        }
+
+        // ── Nudge panel ──
+        getNudge() { return document.getElementById("qa-nudge-input")?.value || ""; }
+        saveNudge() {
+            const v = this.getNudge().trim();
+            clearTimeout(this._nudgeSave);
+            chrome.storage.local.set({ nudgeHint: v });
+            this._updateNudgeIndicator();
+        }
+        closeNudgePanel() {
+            document.getElementById("qa-nudge-panel")?.classList.add("qa-hidden");
+            document.getElementById("qa-nudge-toggle")?.classList.remove("qa-active");
+        }
+        _updateNudgeIndicator() {
+            const btn = document.getElementById("qa-nudge-toggle");
+            const input = document.getElementById("qa-nudge-input");
+            if (btn && input) btn.classList.toggle("qa-nudge-has-hint", !!input.value.trim());
+        }
+
+        // ── Question visibility toggle ──
+        _applyQuestionVisibility() {
+            const qs = document.getElementById("qa-question-section");
+            const os = document.getElementById("qa-options-section");
+            const btn = document.getElementById("qa-toggle");
+            qs?.classList.toggle("qa-hidden", !this._questionVisible);
+            os?.classList.toggle("qa-hidden", !this._questionVisible);
+            if (btn) { btn.classList.toggle("qa-on", this._questionVisible); btn.setAttribute("aria-pressed", String(this._questionVisible)); }
+        }
+
+        // ── Controls wiring ──
+        _wireControls() {
+            const o = this.overlay;
+            o.querySelector("#qa-pause").addEventListener("click", () => {
+                const btn = document.getElementById("qa-pause");
+                const paused = this.handlers.onPauseToggle();   // controller flips + returns new state
+                btn.textContent = paused ? "▶" : "⏸";
+                btn.title = paused ? "Resume auto-detection" : "Pause auto-detection";
+                btn.setAttribute("aria-label", btn.title);
+                this.setPausedVisual(paused);
+            });
+            o.querySelector("#qa-close").addEventListener("click", () => this.handlers.onClose());
+            o.querySelector("#qa-min").addEventListener("click", () => {
+                const c = document.getElementById("qa-content");
+                if (c) c.style.display = c.style.display === "none" ? "" : "none";
+            });
+            o.querySelector("#qa-toggle").addEventListener("click", () => {
+                this._questionVisible = !this._questionVisible;
+                this._applyQuestionVisibility();
+                try { sessionStorage.setItem("__sheja_showq", this._questionVisible ? "1" : "0"); } catch (e) {}
+            });
+
+            const header = o.querySelector("#qa-header");
+            header.addEventListener("mousedown", e => {
+                if (e.target.closest("#qa-controls")) return;
+                this._isDragging = true;
+                const rect = o.getBoundingClientRect();
+                this._dragX = e.clientX - rect.left; this._dragY = e.clientY - rect.top;
+                o.style.top = rect.top + "px"; o.style.left = rect.left + "px";
+                o.style.right = "auto"; o.style.transform = "none";
+                o.classList.add("qa-dragging");
+                e.preventDefault();
+            });
+            o.querySelector("#qa-resize").addEventListener("mousedown", e => {
+                this._isResizing = true;
+                this._rsX = e.clientX; this._rsY = e.clientY;
+                this._rsW = o.offsetWidth;
+                const content = document.getElementById("qa-content");
+                this._rsH = content ? content.offsetHeight : 300;
+                o.classList.add("qa-dragging");
+                e.preventDefault(); e.stopPropagation();
+            });
+
+            o.querySelector("#qa-scan-main").addEventListener("click", () => this.handlers.onRescan());
+
+            o.querySelector("#qa-nudge-toggle").addEventListener("click", () => {
+                const panel = document.getElementById("qa-nudge-panel");
+                const btn = document.getElementById("qa-nudge-toggle");
+                const open = panel.classList.toggle("qa-hidden") === false;
+                btn.classList.toggle("qa-active", open);
+                if (open) document.getElementById("qa-nudge-input")?.focus();
+            });
+            o.querySelector("#qa-nudge-input").addEventListener("input", () => {
+                this._updateNudgeIndicator();
+                clearTimeout(this._nudgeSave);
+                this._nudgeSave = setTimeout(() => {
+                    chrome.storage.local.set({ nudgeHint: (document.getElementById("qa-nudge-input")?.value || "").trim() });
+                }, 600);
+            });
+            o.querySelector("#qa-nudge-input").addEventListener("keydown", e => {
+                if (e.key !== "Enter" || e.shiftKey) return;
+                e.preventDefault(); this.handlers.onNudgeSubmit();
+            });
+            o.querySelector("#qa-nudge-submit").addEventListener("click", () => this.handlers.onNudgeSubmit());
+            o.querySelector("#qa-nudge-clear").addEventListener("click", () => {
+                const input = document.getElementById("qa-nudge-input");
+                if (input) input.value = "";
+                clearTimeout(this._nudgeSave);
+                chrome.storage.local.set({ nudgeHint: "" });
+                this._updateNudgeIndicator();
+                input?.focus();
+            });
+
+            chrome.storage.local.get("nudgeHint", data => {
+                const input = document.getElementById("qa-nudge-input");
+                if (input && data.nudgeHint) { input.value = data.nudgeHint; this._updateNudgeIndicator(); }
+            });
+        }
+
+        _onMouseMove(e) {
+            const o = this.overlay;
+            if (!o) return;
+            if (this._isDragging) {
+                o.style.left = Math.max(0, Math.min(e.clientX - this._dragX, window.innerWidth  - o.offsetWidth))  + "px";
+                o.style.top  = Math.max(0, Math.min(e.clientY - this._dragY, window.innerHeight - o.offsetHeight)) + "px";
+            }
+            if (this._isResizing) {
+                const newW = Math.max(240, Math.min(window.innerWidth - 24, this._rsW + (e.clientX - this._rsX)));
+                const newH = Math.max(120, Math.min(window.innerHeight * 0.88, this._rsH + (e.clientY - this._rsY)));
+                o.style.width = newW + "px";
+                const content = document.getElementById("qa-content");
+                if (content) content.style.maxHeight = newH + "px";
+            }
+        }
+        _onMouseUp() {
+            if (this._isDragging) { this._isDragging = false; this.overlay?.classList.remove("qa-dragging"); this._savePosition(); }
+            if (this._isResizing) { this._isResizing = false; this.overlay?.classList.remove("qa-dragging"); this._saveSize(); }
+        }
+
+        // ── Session persistence ──
+        _savePosition() {
+            try { sessionStorage.setItem("__sheja_pos", JSON.stringify({ top: this.overlay.style.top, left: this.overlay.style.left })); } catch (e) {}
+        }
+        _saveSize() {
+            try {
+                const content = document.getElementById("qa-content");
+                sessionStorage.setItem("__sheja_size", JSON.stringify({ width: this.overlay.style.width, contentH: content?.style.maxHeight || "" }));
+            } catch (e) {}
+        }
+        _restore() {
+            try {
+                const pos = JSON.parse(sessionStorage.getItem("__sheja_pos") || "null");
+                if (pos?.left) { this.overlay.style.top = pos.top; this.overlay.style.left = pos.left; this.overlay.style.right = "auto"; this.overlay.style.transform = "none"; }
+            } catch (e) {}
+            try {
+                const sz = JSON.parse(sessionStorage.getItem("__sheja_size") || "null");
+                if (sz?.width) this.overlay.style.width = sz.width;
+                if (sz?.contentH) { const c = document.getElementById("qa-content"); if (c) c.style.maxHeight = sz.contentH; }
+            } catch (e) {}
+            const saved = sessionStorage.getItem("__sheja_showq");
+            if (saved !== null) this._questionVisible = saved === "1";
+        }
+    }
+
+    // ╔══════════════════════════════════════════════════════════════════════════╗
+    // ║ IngestionEngine — DOM (Plan A) + visual (Plan B) question ingestion.       ║
+    // ╚══════════════════════════════════════════════════════════════════════════╝
+    class IngestionEngine {
+        constructor(bus) {
+            this.bus = bus;
+            this._paused = false;
+            // Detection state
+            this._candidateQ = "";
+            this._candidateTimer = null;
+            this._lastFingerprint = "";
+            this._suppressed = "";              // just-answered fingerprint (skip until it changes)
+            this._cooldownUntil = 0;
+            this._detectSeq = 0;                // cancels superseded readiness gates
+            this._gateTimer = null;
+            // Current authoritative question (for the poll loop)
+            this._currentQuestion = "";
+            this._currentOptions = [];
+            this._currentVisualKey = "";
+            // MutationObserver — rAF-batched so we process at most once per frame.
+            this._batch = new Set();            // deduped text this frame
+            this._pendingTexts = [];            // recycled scratch array (GC-friendly)
+            this._rafPending = false;
+            this._seenNodes = new WeakSet();    // WeakMap-style guard: skip re-seen nodes, no leak
+            this._observer = new MutationObserver(muts => this._onMutations(muts));
+            // Visual/option poll — rAF loop, work throttled to VISUAL_POLL_MS.
+            this._raf = null;
+            this._lastPollAt = 0;
+            this._running = false;
+        }
+
+        start() {
+            this._running = true;
+            this._observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+            this.bus.on("transitionStart", () => this.reset());
+            this.bus.on("lifecycleReset", () => this.suppressCurrent());
+            this._raf = requestAnimationFrame(t => this._visualTick(t));
+        }
+
+        stop() {
+            this._running = false;
+            this._observer.disconnect();
+            if (this._raf) cancelAnimationFrame(this._raf);
+            this._cancelGate();
+            if (this._candidateTimer) clearTimeout(this._candidateTimer);
+            this._batch.clear();
+            this._pendingTexts.length = 0;
+        }
+
+        setPaused(p) { this._paused = p; }
+
+        // Full pipeline reset (on a predicted transition) — drop buffers so the NEXT
+        // question is captured cleanly; clear the fingerprint so a still-visible question
+        // can recover if the transition was a false positive.
+        reset() {
+            this._candidateQ = "";
+            if (this._candidateTimer) { clearTimeout(this._candidateTimer); this._candidateTimer = null; }
+            this._cancelGate();
+            this._batch.clear();
+            this._pendingTexts.length = 0;
+            this._lastFingerprint = "";
+        }
+
+        // After an answer is chosen: suppress the exact just-answered question until it
+        // changes; a genuinely new question still comes through immediately.
+        suppressCurrent() {
+            this._suppressed = this._lastFingerprint;
+            this._cooldownUntil = performance.now() + RESET_COOLDOWN_MS;
+            this._lastFingerprint = "";
+            this._cancelGate();
+        }
+
+        _cancelGate() { if (this._gateTimer) { clearTimeout(this._gateTimer); this._gateTimer = null; } }
+
+        // ── Plan A: DOM mutations ──
+        _onMutations(mutations) {
+            for (const m of mutations) {
+                if (m.type === "characterData") {
+                    const p = m.target.parentElement;
+                    if (p && !p.closest("#" + OVERLAY_ID)) this._batch.add(normalize(m.target.textContent || ""));
+                } else {
+                    for (const node of m.addedNodes) {
+                        if (this._seenNodes.has(node)) continue;
+                        if (node.nodeType === Node.TEXT_NODE && !node.parentElement?.closest("#" + OVERLAY_ID)) {
+                            this._seenNodes.add(node);
+                            this._batch.add(normalize(node.textContent || ""));
+                        } else if (node.nodeType === Node.ELEMENT_NODE && !node.closest?.("#" + OVERLAY_ID)) {
+                            this._seenNodes.add(node);
+                            this._batch.add(normalize(node.textContent || ""));
+                        }
+                    }
+                }
+            }
+            if (!this._rafPending && this._batch.size > 0) {
+                this._rafPending = true;
+                requestAnimationFrame(() => this._processBatch());
+            }
+        }
+
+        _processBatch() {
+            this._rafPending = false;
+            // Drain into the recycled array, then clear the Set (avoids per-frame allocation).
+            this._pendingTexts.length = 0;
+            for (const t of this._batch) this._pendingTexts.push(t);
+            this._batch.clear();
+            for (const t of this._pendingTexts) this._processText(t);
+            this._pendingTexts.length = 0;
+            if (this._candidateQ) this._scheduleFlush();
+        }
+
+        _processText(raw) {
+            const text = normalize(raw);
+            if (text.length < 8 || text.length > 300 || isJunk(text) || !looksLikeQuestion(text)) return;
+            const deduped = dedupeQuestion(text);
+            const clean = truncateAtQuestionMark(deduped, deduped.includes("?") ? extractAnswers() : []);
+            if (clean.length < 8 || clean.trim().split(/\s+/).length < 3) return;
+            if (isBetterCandidate(clean, this._candidateQ)) this._candidateQ = clean;
+        }
+
+        // Micro-debounce so partial hydration doesn't fire early. A complete ("?") stem
+        // flushes fast; the readiness gate handles option-waiting separately.
+        _scheduleFlush() {
+            if (this._candidateTimer) clearTimeout(this._candidateTimer);
+            const delay = this._candidateQ.trim().endsWith("?") ? DEBOUNCE_Q_MS : DEBOUNCE_MS;
+            this._candidateTimer = setTimeout(() => {
+                const q = this._candidateQ;
+                this._candidateQ = "";
+                this._candidateTimer = null;
+                if (q) this._tryRecord(q);
+            }, delay);
+        }
+
+        // ── Plan B: visual fingerprint + option-change poll (rAF, throttled) ──
+        _visualTick(_ts) {
+            if (!this._running) return;
+            this._raf = requestAnimationFrame(t => this._visualTick(t));
+            const now = performance.now();
+            if (now - this._lastPollAt < VISUAL_POLL_MS) return;   // throttle real work
+            this._lastPollAt = now;
+            if (this._paused || !this._currentQuestion || now < this._cooldownUntil) return;
+
+            const current = extractAnswers();
+            const freshQ = scanForCurrentQuestion() || this._currentQuestion;
+            const currentVisualKey = needsVision(freshQ) ? visualFingerprint() : "";
+            const sameAnswers = current.join("|") === this._currentOptions.join("|");
+            const sameVisual = currentVisualKey === this._currentVisualKey;
+            // Nothing actionable, or nothing changed (e.g. a decorative image swap).
+            if ((current.length < 2 && !currentVisualKey) || (sameAnswers && sameVisual)) return;
+            // A new flag with the SAME question text, or new options → re-detect.
+            this._tryRecord(freshQ);
+        }
+
+        // ── Shared detection entry (from both plans) ──
+        _tryRecord(questionText) {
+            if (this._paused) return;
+            const answers = extractAnswers();
+            const question = truncateAtQuestionMark(dedupeQuestion(questionText), answers);
+            if (question.length < 8) return;
+            if (performance.now() < this._cooldownUntil) return;
+
+            const visualKey = needsVision(question) ? visualFingerprint() : "";
+            // Fingerprint excludes options so [] → [4 options] is ONE question; the
+            // readiness gate handles option-waiting.
+            const fingerprint = question + "\n" + visualKey;
+            if (fingerprint === this._suppressed) return;      // just-answered, unchanged
+            this._suppressed = "";                             // any different question clears suppression
+            if (fingerprint === this._lastFingerprint) return; // dedupe
+
+            this._lastFingerprint = fingerprint;               // claim immediately (re-entry short-circuits)
+            const seq = ++this._detectSeq;
+            this._cancelGate();
+            // Provisional emit so the overlay shows the question text right away.
+            this.bus.emit("question:detecting", { question, options: answers.length >= 2 ? answers : [] });
+            this._waitForSurface(question, visualKey, seq, performance.now());
+        }
+
+        // Poll until the answer surface exists, then emit questionDetected exactly once.
+        _waitForSurface(question, visualKey, seq, startedAt) {
+            if (seq !== this._detectSeq) return;               // superseded
+            const elapsed = performance.now() - startedAt;
+            const surface = classifyAnswerSurface(question, elapsed);
+            if (surface.kind !== "none") { this._emitDetected(question, visualKey, surface, seq); return; }
+            if (elapsed >= GATE_MAX_MS) {                       // give up — best effort
+                const btns = extractAnswers();
+                this._emitDetected(question, visualKey, btns.length >= 2 ? { kind: "mc", answers: btns } : { kind: "open", answers: [] }, seq);
+                return;
+            }
+            this.bus.emit("question:waiting", {});
+            this._gateTimer = setTimeout(() => this._waitForSurface(question, visualKey, seq, startedAt), GATE_INTERVAL_MS);
+        }
+
+        _emitDetected(question, visualKey, surface, seq) {
+            if (seq !== this._detectSeq) return;
+            this._gateTimer = null;
+            this._currentQuestion = question;
+            this._currentOptions = surface.answers;
+            this._currentVisualKey = visualKey;
+            this.bus.emit("questionDetected", { question, options: surface.answers, visualKey, timestamp: Date.now() });
+        }
+    }
+
+    // ╔══════════════════════════════════════════════════════════════════════════╗
+    // ║ TransitionSensor — predictive next-question detection.                     ║
+    // ╚══════════════════════════════════════════════════════════════════════════╝
+    class TransitionSensor {
+        constructor(bus) {
+            this.bus = bus;
+            this._interval = null;
+            this._loaderWasPresent = false;
+            this._lastH = null; this._lastW = null;
+            this._refractoryUntil = 0;
+        }
+        start() { this._interval = setInterval(() => this._tick(), TRANSITION_POLL_MS); }
+        stop()  { if (this._interval) { clearInterval(this._interval); this._interval = null; } }
+
+        _container() { return document.querySelector("main, article, [role='main']") || document.body; }
+
+        _loaderPresent() {
+            const els = document.querySelectorAll("[role='progressbar'], .loader, .skeleton, .spinner");
+            for (const el of els) {
+                if (el.closest("#" + OVERLAY_ID)) continue;
+                const r = el.getBoundingClientRect();
+                if (r.width > 0 && r.height > 0 && inViewport(r, 50)) return true;
+            }
+            return false;
+        }
+
+        _emit(type) {
+            const now = performance.now();
+            if (now < this._refractoryUntil) return;
+            this._refractoryUntil = now + TRANSITION_REFRACTORY_MS;
+            this.bus.emit("transitionStart", { type, timestamp: Date.now() });
+        }
+
+        _tick() {
+            // Primary, reliable signal: a loader/skeleton appearing (rising edge).
+            const loader = this._loaderPresent();
+            if (loader && !this._loaderWasPresent) this._emit("loader");
+            this._loaderWasPresent = loader;
+
+            // Secondary heuristic: a large layout shift of the main content container.
+            const c = this._container();
+            if (!c) return;
+            const r = c.getBoundingClientRect();
+            if (this._lastH != null &&
+                (Math.abs(r.height - this._lastH) > LAYOUT_SHIFT_PX || Math.abs(r.width - this._lastW) > LAYOUT_SHIFT_PX)) {
+                this._emit("layout");
+            }
+            this._lastH = r.height; this._lastW = r.width;
+        }
+    }
+
+    // ╔══════════════════════════════════════════════════════════════════════════╗
+    // ║ EventLifecycleManager — capture-phase click interception.                  ║
+    // ╚══════════════════════════════════════════════════════════════════════════╝
+    class EventLifecycleManager {
+        constructor(bus, getOptions) {
+            this.bus = bus;
+            this._getOptions = getOptions;                 // () => current option strings
+            this._onClick = this._onClick.bind(this);
+        }
+        start() { document.addEventListener("click", this._onClick, true); }   // capture phase = earliest
+        stop()  { document.removeEventListener("click", this._onClick, true); }
+
+        _onClick(e) {
+            const el = clickableFrom(e.target);
+            if (!el || el.closest("#" + OVERLAY_ID)) return;   // overlay clicks handled by the view
+            const r = el.getBoundingClientRect();
+            if (r.width < 60 || r.height < 20) return;         // answer-like size gate
+            const key = normKey(el.textContent || "");
+            if (!key) return;
+            const opts = this._getOptions() || [];
+            const isAnswer = opts.some(o => {
+                const k = normKey(o);
+                return k && (k === key || key.startsWith(k) || k.startsWith(key) || tokenOverlap(k, key) >= 0.6);
+            });
+            if (isAnswer) this.bus.emit("lifecycleReset", { timestamp: Date.now() });
+        }
+    }
+
+    // ╔══════════════════════════════════════════════════════════════════════════╗
+    // ║ Orchestrator — owns state + back-pressure and wires everything together.   ║
+    // ╚══════════════════════════════════════════════════════════════════════════╝
+    class Orchestrator {
+        constructor() {
+            this.bus = new EventBus();
+            this.reqId = 0;                 // back-pressure: discards stale AI responses
+            this._loading = false;
+            this._paused = false;
+            this.questionCount = 0;
+            this.currentQuestion = "";
+            this.currentOptions = [];
+            this.currentVisualKey = "";
+            this._lastAnswerAt = 0;
+
+            this.overlay = new OverlayUI({
+                onClose:       () => this.destroy(),
+                onPauseToggle: () => this._togglePause(),
+                onRescan:      () => this.onRescan(),
+                onNudgeSubmit: () => this.onNudgeSubmit(),
+                onFill:        (t, isMC) => this.onFill(t, isMC)
+            });
+            this.capture = new CapturePipeline({
+                hide: () => this.overlay.setHidden(true),
+                show: () => this.overlay.setHidden(false)
+            });
+            this.solver = new Solver({ capture: this.capture, getNudge: () => this.overlay.getNudge() });
+            this.filler = new AnswerFiller();
+            this.ingestion = new IngestionEngine(this.bus);
+            this.transition = new TransitionSensor(this.bus);
+            this.lifecycle = new EventLifecycleManager(this.bus, () => this.currentOptions);
+        }
+
+        start() {
+            this.overlay.mount();
+            this.overlay.setStatus("idle");
+            this.bus.on("question:detecting", p => this._onDetecting(p));
+            this.bus.on("question:waiting",   () => { if (this._loading) this.overlay.setStatus("waiting"); });
+            this.bus.on("questionDetected",   p => this.onQuestionDetected(p));
+            this.bus.on("transitionStart",    p => this.onTransition(p));
+            this.bus.on("lifecycleReset",     p => this.onReset(p));
+            this.ingestion.start();
+            this.transition.start();
+            this.lifecycle.start();
+        }
+
+        destroy() {
+            this.ingestion.stop();
+            this.transition.stop();
+            this.lifecycle.stop();
+            this.overlay.destroy();
+            this.bus.clear();
+        }
+
+        _togglePause() {
+            this._paused = !this._paused;
+            this.ingestion.setPaused(this._paused);
+            if (this._paused) {
+                this.reqId++;                  // abandon any in-flight solve
+                if (this._loading) { this._loading = false; this.overlay.showIdle("Paused."); }
+                this.overlay.setStatus("paused");
+            } else {
+                this.overlay.setStatus("idle");
+            }
+            return this._paused;
+        }
+
+        // Provisional: show the question text as soon as it's found (before options settle).
+        _onDetecting({ question, options }) {
+            if (this._paused) return;
+            this.questionCount++;
+            this.currentQuestion = question;
+            this.currentOptions = options;
+            this.overlay.renderQuestion(question, options, this.questionCount);
+            this.overlay.setStatus("detecting");
+            this._loading = true;
+            this.overlay.showLoading("Reading question…");
+        }
+
+        // Answer surface is ready → run the AI with back-pressure.
+        onQuestionDetected({ question, options, visualKey }) {
+            if (this._paused) return;
+            const myId = ++this.reqId;
+            this.currentQuestion = question;
+            this.currentOptions = options;
+            this.currentVisualKey = visualKey;
+            this.filler.capture();                                  // snapshot option nodes for click-time
+            this.overlay.renderQuestion(question, options, this.questionCount);
+            this.overlay.setStatus("asking");
+            this._loading = true;
+            this.overlay.showLoading(needsVision(question) ? "Reading the screenshot…" : "Thinking…");
+            log("question", { q: question, opts: options, count: this.questionCount });
+            this._solve(question, options, myId, { autoFill: false });
+        }
+
+        _solve(question, options, myId, { imageDataUrl = null, autoFill = false } = {}) {
+            this.solver.solve(question, options, {
+                imageDataUrl,
+                onProgress: s => this._onProgress(s),
+                isStale: () => myId !== this.reqId
+            }).then(res => {
+                if (myId !== this.reqId || !res) return;
+                this._loading = false;
+                this.overlay.setStatus("answered");
+                this.overlay.showAnswer(res.resolved, res.provider, res.usedImage, autoFill, options);
+            }).catch(err => {
+                if (myId !== this.reqId) return;
+                this._loading = false;
+                this.overlay.setStatus("error");
+                this.overlay.showError(err.message || "AI error");
+                log("err", { error: err.message });
+            });
+        }
+
+        _onProgress(stage) {
+            const MAP = {
+                screenshot:     "Reading the screenshot…",
+                "asking-vision":"Reading the screenshot…",
+                asking:         "Thinking…",
+                strict:         "Double-checking…",
+                voting:         "Verifying answer…"
+            };
+            this.overlay.showLoading(MAP[stage] || "Thinking…");
+        }
+
+        // A transition was predicted. Ingestion resets its own pipeline (via its
+        // subscription) so the NEXT question is captured cleanly. We deliberately do NOT
+        // cancel an in-flight solve here: if a real new question follows, its detection
+        // supersedes the old one via reqId (no stale answer lands); if this was a false
+        // positive (layout jitter with no new question), the in-flight answer still
+        // arrives instead of leaving a hung spinner. Back-pressure, not eager cancel.
+        onTransition({ type }) {
+            log("transition", { type });
+            if (!this._loading) this.overlay.clearAnswerAccent();   // shown answer reads as stale
+        }
+
+        // An answer was chosen (by us or the user) — the user has moved on, so abandon any
+        // in-flight solve for this question rather than waste an answer they won't use.
+        onReset() {
+            log("reset", {});
+            this._lastAnswerAt = Date.now();
+            if (this._loading) {
+                this.reqId++;
+                this._loading = false;
+                this.overlay.setStatus("idle");
+                this.overlay.showIdle("Answer selected.");
+            }
+        }
+
+        // Apply the AI's answer to the page. suppressCurrent() also covers open-ended,
+        // where no page answer-click fires the lifecycle reset.
+        onFill(fillText, isMC) {
+            return this.filler.fill(fillText, isMC).then(ok => {
+                if (ok) { this.ingestion.suppressCurrent(); this._lastAnswerAt = Date.now(); }
+                return ok;
+            });
+        }
+
+        // Manual "Re-ask AI" — always screenshots and auto-fills.
+        onRescan() {
+            const scannedQ = scanForCurrentQuestion();
+            const freshQ = scannedQ || this.currentQuestion || "";
+            const freshA = extractAnswers();
+            const sameQ = scannedQ && scannedQ === this.currentQuestion;
+            const sameVis = visualFingerprint() === this.currentVisualKey;
+            const scanAns = freshA.length >= 2 ? freshA : (sameQ && sameVis ? this.currentOptions : []);
+
+            const myId = ++this.reqId;
+            this.currentQuestion = freshQ;
+            this.currentOptions = scanAns;
+            this.filler.capture();
+            this.overlay.renderQuestion(freshQ, scanAns, this.questionCount);
+            this.overlay.setStatus("asking");
+            this._loading = true;
+            this.overlay.showLoading("Scanning screen…");
+            log("call", { mode: "manual-scan" });
+
+            this.capture.capture().then(({ dataUrl, error }) => {
+                if (myId !== this.reqId) return;
+                if (!dataUrl) {
+                    this._loading = false;
+                    this.overlay.setStatus("error");
+                    this.overlay.showError(error || "Screenshot failed — check extension permissions");
+                    return;
+                }
+                this._solve(freshQ || "What is shown in this image?", scanAns, myId, { imageDataUrl: dataUrl, autoFill: true });
+            });
+        }
+
+        // Nudge submitted — re-ask the current question with the hint (no auto-fill).
+        onNudgeSubmit() {
+            this.overlay.saveNudge();
+            this.overlay.closeNudgePanel();
+            if (!this.currentQuestion) return;
+            const freshA = extractAnswers();
+            const ans = freshA.length >= 2 ? freshA : this.currentOptions;
+            const myId = ++this.reqId;
+            this.currentOptions = ans;
+            this.filler.capture();
+            this.overlay.setStatus("asking");
+            this._loading = true;
+            this.overlay.showLoading("Re-asking with your hint…");
+            log("call", { mode: "nudge" });
+            this._solve(this.currentQuestion, ans, myId, { autoFill: false });
+        }
+    }
+
+    // ╔══════════════════════════════════════════════════════════════════════════╗
+    // ║ Overlay markup + styles (unchanged look; kept out of the class for clarity)║
+    // ╚══════════════════════════════════════════════════════════════════════════╝
+    const OVERLAY_CSS = `
     #qa-overlay {
         --qa-bg: rgba(14, 12, 28, 0.97);
         --qa-surface: rgba(255,255,255,.045);
@@ -448,7 +1626,6 @@
         outline: 2px solid var(--qa-accent-2) !important; outline-offset: 2px !important; border-radius: 7px;
     }
 
-    /* ─ Header ─ */
     #qa-header {
         display: flex; align-items: center; gap: 8px;
         padding: 11px 11px 11px 14px;
@@ -493,7 +1670,6 @@
     .qa-icon-btn:hover { background: rgba(255,255,255,.26); border-color: rgba(255,255,255,.34); }
     .qa-icon-btn.qa-on { background: #fff; color: #5a44d6 !important; border-color: #fff; }
 
-    /* ─ Content ─ */
     #qa-content {
         max-height: calc(86vh - 52px); overflow-y: auto;
         padding: 11px; display: flex; flex-direction: column; gap: 9px;
@@ -543,7 +1719,6 @@
     }
     #qa-options li.qa-none::before { content: none !important; }
 
-    /* ─ Answer card (state accents: ok / warn / err) ─ */
     .qa-section--answer {
         background: var(--qa-surface); border: 1px solid var(--qa-border);
         transition: border-color .35s, background .35s, box-shadow .35s;
@@ -567,7 +1742,6 @@
     }
     .qa-idle { color: var(--qa-text-faint) !important; font-size: 12.5px !important; padding: 3px 0; }
 
-    /* loading — spinner ring (distinct from idle / answered) */
     .qa-loading {
         display: flex; align-items: center; gap: 10px; padding: 3px 0;
         color: var(--qa-text-dim) !important; font-size: 12.5px !important; font-weight: 600 !important;
@@ -579,7 +1753,6 @@
     }
     @keyframes qa-spin { to { transform: rotate(360deg); } }
 
-    /* answer */
     .qa-answer-wrap {
         display: flex; flex-direction: column; gap: 8px;
         animation: qa-appear .26s cubic-bezier(.34,1.56,.64,1);
@@ -607,7 +1780,6 @@
     .qa-answer-text--guess:hover { color: #ffe08a !important; }
     .qa-answer-text.qa-filled { opacity: .32 !important; text-decoration: line-through !important; cursor: default !important; }
 
-    /* confidence chip */
     .qa-chip {
         flex-shrink: 0; font-size: 10px !important; font-weight: 800 !important;
         border-radius: 999px; padding: 2px 9px;
@@ -633,7 +1805,6 @@
         border-radius: 8px; padding: 8px 11px;
     }
 
-    /* ─ Footer ─ */
     #qa-footer { display: flex; gap: 7px; align-items: stretch; }
     .qa-btn {
         display: inline-flex; align-items: center; justify-content: center; gap: 6px;
@@ -663,7 +1834,6 @@
         border-radius: 50%; background: var(--qa-ok); box-shadow: 0 0 5px rgba(70,227,160,.7);
     }
 
-    /* ─ Nudge panel ─ */
     #qa-nudge-panel {
         display: flex; flex-direction: column; gap: 7px;
         background: var(--qa-surface); border: 1px solid var(--qa-border);
@@ -694,7 +1864,6 @@
     }
     .qa-btn--nudge-submit:hover { opacity: .88; }
 
-    /* ─ Resize handle ─ */
     #qa-resize { position: absolute; bottom: 0; right: 0; width: 20px; height: 20px; cursor: nwse-resize; z-index: 10; }
     #qa-resize::after {
         content: ""; position: absolute; right: 5px; bottom: 5px; width: 7px; height: 7px;
@@ -704,10 +1873,7 @@
     #qa-resize:hover::after { opacity: 1; }
     `;
 
-    // ── Overlay HTML ───────────────────────────────────────────────────────────
-    const overlay = document.createElement("div");
-    overlay.id = "qa-overlay";
-    overlay.innerHTML = `
+    const OVERLAY_HTML = `
         <div id="qa-header">
             <span id="qa-title">✶ Sheja Asks<span id="qa-q-count" style="display:none"></span></span>
             <span id="qa-status" role="status" aria-live="polite"><span class="qa-led"></span>Ready</span>
@@ -753,940 +1919,42 @@
         <div id="qa-resize" title="Drag to resize" aria-hidden="true"></div>
     `;
 
-    // ── Session persistence ────────────────────────────────────────────────────
-    function savePosition() {
-        try {
-            sessionStorage.setItem("__sheja_pos", JSON.stringify({
-                top: overlay.style.top, left: overlay.style.left
-            }));
-        } catch (e) {}
-    }
-
-    function saveSize() {
-        try {
-            const content = document.getElementById("qa-content");
-            sessionStorage.setItem("__sheja_size", JSON.stringify({
-                width: overlay.style.width,
-                contentH: content?.style.maxHeight || ""
-            }));
-        } catch (e) {}
-    }
-
-    function restorePosition() {
-        try {
-            const pos = JSON.parse(sessionStorage.getItem("__sheja_pos") || "null");
-            if (pos?.left) {
-                overlay.style.top = pos.top; overlay.style.left = pos.left;
-                overlay.style.right = "auto"; overlay.style.transform = "none";
-            }
-        } catch (e) {}
-        try {
-            const sz = JSON.parse(sessionStorage.getItem("__sheja_size") || "null");
-            if (sz?.width) overlay.style.width = sz.width;
-            if (sz?.contentH) {
-                const content = document.getElementById("qa-content");
-                if (content) content.style.maxHeight = sz.contentH;
-            }
-        } catch (e) {}
-        const saved = sessionStorage.getItem("__sheja_showq");
-        if (saved !== null) questionVisible = saved === "1";
-    }
-
-    // ── UI ──────────────────────────────────────────────────────────────────────
-    function setProviderBadge(text) {
-        const el = document.getElementById("qa-provider-badge");
-        if (el) el.textContent = text;
-    }
-
-    // Pipeline status pill: ready → reading → waiting → thinking → answer ready → error.
-    const _STATUS = {
-        idle:      { label: "Ready",                cls: "qa-s-idle" },
-        detecting: { label: "Reading question…",    cls: "qa-s-busy" },
-        waiting:   { label: "Waiting for options…", cls: "qa-s-busy" },
-        asking:    { label: "Thinking…",            cls: "qa-s-busy" },
-        answered:  { label: "Answer ready",         cls: "qa-s-ok"   },
-        error:     { label: "Error",                cls: "qa-s-err"  },
-        paused:    { label: "Paused",               cls: "qa-s-warn" }
-    };
-    function setStatus(key) {
-        const el = document.getElementById("qa-status");
-        if (!el) return;
-        const s = _STATUS[key] || _STATUS.idle;
-        el.className = s.cls || "";
-        el.innerHTML = '<span class="qa-led"></span>';
-        el.appendChild(document.createTextNode(s.label));
-    }
-
-    // Drop the answer-card accent (used between states so a stale colour doesn't linger).
-    function clearAnswerState() {
-        const card = document.querySelector(".qa-section--answer");
-        if (card) card.classList.remove("qa-state-ok", "qa-state-warn", "qa-state-err");
-    }
-
-    // Fades #qa-ai out, rebuilds content via buildFn, fades back in.
-    // Cancels any pending fade so stale questions can't overwrite a new one.
-    function fadeAiTo(buildFn) {
-        const el = document.getElementById("qa-ai");
-        if (!el) return;
-        if (_fadeTimer) { clearTimeout(_fadeTimer); _fadeTimer = null; }
-        el.style.opacity   = "0";
-        el.style.transform = "translateY(4px)";
-        _fadeTimer = setTimeout(() => {
-            _fadeTimer = null;
-            el.innerHTML = "";
-            buildFn(el);
-            requestAnimationFrame(() => {
-                el.style.opacity   = "1";
-                el.style.transform = "translateY(0)";
-            });
-        }, 90);
-    }
-
-    function showLoading(label) {
-        setProviderBadge("");
-        clearAnswerState();
-        fadeAiTo(el => {
-            const wrap = document.createElement("div");
-            wrap.className = "qa-loading";
-            const sp = document.createElement("div");
-            sp.className = "qa-spinner";
-            const txt  = document.createElement("span");
-            txt.textContent = label || "Thinking…";
-            wrap.appendChild(sp);
-            wrap.appendChild(txt);
-            el.appendChild(wrap);
-        });
-    }
-
-    function showError(msg) {
-        setProviderBadge("");
-        clearAnswerState();
-        const card = document.querySelector(".qa-section--answer");
-        if (card) card.classList.add("qa-state-err");
-        fadeAiTo(el => {
-            const wrap = document.createElement("div");
-            wrap.className = "qa-answer-wrap";
-
-            const err = document.createElement("div");
-            err.className = "qa-error";
-            err.textContent = "⚠ " + msg;
-            wrap.appendChild(err);
-
-            el.appendChild(wrap);
-        });
-    }
-
-    function showAnswer(answer, provider, isVisual, visualPending, autoFill, answerOptions, resolved) {
-        const NAMES = { claude: "Claude", openai: "ChatGPT", gemini: "Gemini", mistral: "Mistral" };
-        const optionsForAnswer = answerOptions || overlayAnswers;
-
-        const parsed   = resolved || parseAnswer(answer, optionsForAnswer);
-        const fillText = parsed.fillText;
-        const reason   = parsed.reason;
-        const lowConfidence = parsed.lowConfidence;
-        const confidence = (parsed.confidence != null) ? parsed.confidence : null;
-
-        // Single letter/digit choice (A–E, 1–9) → show as badge
-        const choiceMatch = fillText.match(/^([A-Ea-e]|[1-9])\.?$/);
-        const badge       = choiceMatch ? fillText.replace(".", "").toUpperCase() : null;
-
-        setProviderBadge(isVisual ? (NAMES[provider] || provider) + " 📷" : (NAMES[provider] || provider));
-
-        // Answer card accent: green when confident, amber for a best guess.
-        const card = document.querySelector(".qa-section--answer");
-        if (card) {
-            card.classList.remove("qa-state-ok", "qa-state-warn", "qa-state-err");
-            card.classList.add(lowConfidence ? "qa-state-warn" : "qa-state-ok");
-        }
-
-        fadeAiTo(el => {
-            let filled = false;
-
-            // Multi-strategy click: exact (clickAnswer 3-tier) → no leading article → no punctuation.
-            function attemptClick(t) {
-                if (clickAnswer(t)) return true;
-                const noArticle = t.replace(/^(the|a|an)\s+/i, "").trim();
-                if (noArticle !== t && clickAnswer(noArticle)) return true;
-                const noPunct = t.replace(/[.,!?;:'"()]/g, "").trim();
-                if (noPunct !== t && clickAnswer(noPunct)) return true;
-                return false;
-            }
-
-            function markFilled(method) {
-                filledQuestion = overlayQuestion;
-                lastAnswerAt   = Date.now();
-                log("fill", { ans: fillText, method });
-            }
-
-            function doFill() {
-                if (filled) return;
-                filled = true;
-                textEl.classList.add("qa-filled");
-                const isMC = optionsForAnswer.length >= 2;
-
-                if (isMC) {
-                    // MC: ONLY click an option button. Retry while buttons render; never
-                    // type into a text input (that would hit the page's search box).
-                    let tries = 0;
-                    (function tryClick() {
-                        if (filled === false) return;
-                        if (attemptClick(fillText)) {
-                            markFilled("click_btn");
-                            setTimeout(autoSubmit, SUBMIT_INIT_MS);
-                            return;
-                        }
-                        if (++tries < 8) { setTimeout(tryClick, 200); return; }
-                        filled = false;
-                        textEl.classList.remove("qa-filled");
-                        log("fill", { ans: fillText, method: "no_btn", tries });
-                    })();
-                    return;
-                }
-
-                // Open-ended: type into the answer input; fall back to a button if no input.
-                const input = findTextInput();
-                if (input) {
-                    markFilled("fill_input");
-                    fillInput(input, fillText);
-                    setTimeout(autoSubmit, 60);
-                } else if (attemptClick(fillText)) {
-                    markFilled("click_btn");
-                    setTimeout(autoSubmit, SUBMIT_INIT_MS);
-                } else {
-                    filled = false;
-                    textEl.classList.remove("qa-filled");
-                    log("fill", { ans: fillText, method: "no_target" });
-                }
-            }
-
-            const wrap = document.createElement("div");
-            wrap.className = "qa-answer-wrap";
-
-            const row = document.createElement("div");
-            row.className = "qa-answer-row";
-
-            if (badge) {
-                const badgeEl = document.createElement("span");
-                badgeEl.className = "qa-badge";
-                badgeEl.textContent = badge;
-                row.appendChild(badgeEl);
-            }
-
-            const textEl = document.createElement("span");
-            textEl.className = "qa-answer-text"
-                + (fillText.length > 20 ? " qa-answer-text--sm" : "")
-                + (lowConfidence ? " qa-answer-text--guess" : "");
-            textEl.textContent = badge ? (reason || fillText) : fillText;
-            // Keyboard-operable: Enter/Space selects the answer on the page, same as a click.
-            textEl.setAttribute("role", "button");
-            textEl.tabIndex = 0;
-            textEl.title = optionsForAnswer.length ? "Select this answer on the page" : "Type this answer into the page";
-            textEl.addEventListener("click", doFill);
-            textEl.addEventListener("keydown", e => {
-                if (e.key === "Enter" || e.key === " ") { e.preventDefault(); doFill(); }
-            });
-            row.appendChild(textEl);
-
-            // Confidence chip — High / Likely / Best guess, with the model's percentage.
-            if (confidence != null) {
-                const chip = document.createElement("span");
-                const pct  = Math.round(confidence * 100);
-                let cls = "qa-chip--mid", word = "Likely";
-                if (confidence >= 0.85)      { cls = "qa-chip--ok";  word = "High"; }
-                else if (confidence < VOTE_CONF) { cls = "qa-chip--low"; word = "Best guess"; }
-                chip.className = "qa-chip " + cls;
-                chip.textContent = `${word} · ${pct}%`;
-                row.appendChild(chip);
-            }
-            wrap.appendChild(row);
-
-            if (lowConfidence) {
-                const g = document.createElement("div");
-                g.className = "qa-guess-note";
-                g.textContent = "⚠ Best guess — verify before you submit.";
-                wrap.appendChild(g);
-            }
-
-            if (reason && !badge) {
-                const reasonEl = document.createElement("div");
-                reasonEl.className = "qa-reason";
-                reasonEl.textContent = reason;
-                wrap.appendChild(reasonEl);
-            }
-
-            if (!optionsForAnswer.length) {
-                const hint = document.createElement("div");
-                hint.className = "qa-hint";
-                hint.textContent = "📝 Open-ended — click the answer to type it in.";
-                wrap.appendChild(hint);
-            }
-
-            // Auto-fill only on manual rescan, not on auto-detected questions
-            if (autoFill) setTimeout(doFill, AUTOFILL_MS);
-
-            el.appendChild(wrap);
-        });
-    }
-
-    // ── Answer-parsing helpers ──────────────────────────────────────────────────
-    // Is `text` exactly `prefix`, or `prefix` followed by a non-word char (word boundary)?
-    function startsWithWord(text, prefix) {
-        if (!text.startsWith(prefix)) return false;
-        if (text.length === prefix.length) return true;
-        return !/[a-z0-9]/i.test(text.charAt(prefix.length));
-    }
-
-    // Strip wrapping [brackets] and "quotes" the model sometimes adds.
-    function stripWrap(s) {
-        return (s || "")
-            .replace(/^\[(.+)\]$/, "$1")
-            .replace(/^["'“”‘’](.+)["'“”‘’]$/, "$1")
-            .trim();
-    }
-
-    // Keep displayed reasons short.
-    function clampReason(r) {
-        r = (r || "").trim();
-        if (r.length > 120) r = r.slice(0, 117).trimEnd() + "…";
-        return r;
-    }
-
-    // Closest option by word overlap / substring — last-resort when the model answers
-    // off-list, so the overlay still shows a real option (flagged low-confidence).
-    function closestOption(text, options) {
-        const t = text.toLowerCase();
-        const tWords = new Set(t.split(/[^a-z0-9]+/).filter(Boolean));
-        let best = null, bestScore = 0;
-        for (const opt of options) {
-            const o = opt.toLowerCase();
-            let score = 0;
-            for (const w of o.split(/[^a-z0-9]+/).filter(Boolean)) if (tWords.has(w)) score += 10;
-            if (t && (t.includes(o) || o.includes(t))) score += 5;
-            if (score > bestScore) { bestScore = score; best = opt; }
-        }
-        return bestScore > 0 ? best : null;
-    }
-
-    // Returns { fillText, reason, lowConfidence }. fillText is ALWAYS a clean answer:
-    // an exact option for MC, or 1-3 words for open-ended — never the reason blob.
-    function parseAnswer(answer, answerOptions) {
-        const rawText   = (answer || "").replace(/\r/g, "");
-        const lines     = rawText.split("\n").map(l => normalize(l)).filter(Boolean);
-        const text      = normalize(rawText);
-        const line1     = lines[0] || "";
-        const restLines = lines.slice(1).join(" ").trim();
-
-        // ── Multiple-choice: always resolve to a real option ──
-        if (answerOptions?.length) {
-            const options = [...answerOptions].sort((a, b) => b.length - a.length);
-            const cands   = [stripWrap(line1).toLowerCase(), line1.toLowerCase(), text.toLowerCase()];
-
-            const pick = (test) => {
-                for (const opt of options) {
-                    const o = opt.toLowerCase();
-                    if (!o) continue;
-                    for (const c of cands) if (test(c, o)) return opt;
-                }
-                return null;
-            };
-
-            let option =
-                pick((c, o) => c === o) ||                        // exact
-                pick((c, o) => startsWithWord(c, o)) ||           // word-boundary prefix
-                pick((c, o) => {                                  // whole-word contained
-                    const i = c.indexOf(o);
-                    if (i === -1) return false;
-                    const before = i === 0 || !/[a-z0-9]/i.test(c.charAt(i - 1));
-                    return before && startsWithWord(c.slice(i), o);
-                });
-
-            let lowConfidence = false;
-            if (!option) { option = closestOption(text, options); lowConfidence = true; }
-
-            if (option) {
-                const o = option.toLowerCase();
-                let reason = "";
-                const src = line1.toLowerCase().startsWith(o) ? line1
-                          : text.toLowerCase().startsWith(o)  ? text : "";
-                if (src) {
-                    let rest = src.slice(option.length).trim().replace(/^[—–\-:.]\s*/, "").trim();
-                    if (rest.toLowerCase().startsWith(o)) // collapse a repeated answer
-                        rest = rest.slice(option.length).trim().replace(/^[—–\-:.]\s*/, "").trim();
-                    reason = rest;
-                }
-                if (!reason && restLines && line1.toLowerCase() === o) reason = restLines;
-                return { fillText: option, reason: clampReason(reason), lowConfidence };
-            }
-
-            // Nothing matched at all — best-effort short text, flagged for re-ask.
-            const fallback = stripWrap(line1 || text).split(/\s+/).slice(0, 4).join(" ");
-            return { fillText: fallback, reason: clampReason(restLines), lowConfidence: true };
-        }
-
-        // ── Open-ended ──
-        if (lines.length >= 2) {
-            return { fillText: stripWrap(line1), reason: clampReason(restLines), lowConfidence: false };
-        }
-        const m = text.match(/^(.+?)\s+[—–-]\s+(.+)$/);
-        if (m) {
-            return { fillText: stripWrap(m[1].trim()), reason: clampReason(m[2].trim()), lowConfidence: false };
-        }
-        // No separator — bound the blob: first sentence, else first 3 words.
-        let fill = text;
-        const sentence = text.match(/^(.*?[.!?])(\s|$)/);
-        if (sentence && sentence[1].length <= 60) fill = sentence[1].replace(/[.!?]+$/, "").trim();
-        if (fill.split(/\s+/).length > 3) fill = fill.split(/\s+/).slice(0, 3).join(" ");
-        return { fillText: stripWrap(fill), reason: "", lowConfidence: false };
-    }
-
-    // ── Screenshot ─────────────────────────────────────────────────────────────
-    function captureScreen(callback) {
-        overlay.style.visibility = "hidden";
-        const deadline = Date.now() + IMG_WAIT_MS;
-
-        function checkImages() {
-            const pending = [...document.querySelectorAll("img")].find(img => {
-                if (img.closest("#qa-overlay") || img.complete) return false;
-                const r = img.getBoundingClientRect();
-                return r.width > 180 && r.height > 130 && inViewport(r, 10);
-            });
-            if (!pending || Date.now() >= deadline) {
-                requestAnimationFrame(() => setTimeout(() => {
-                    runtimeSend({ action: "takeScreenshot" }, resp => {
-                        overlay.style.visibility = "";
-                        callback(resp?.dataUrl || null, resp?.error || null);
-                    });
-                }, 40));
-            } else {
-                setTimeout(checkImages, 80);
-            }
-        }
-        requestAnimationFrame(checkImages);
-    }
-
-    // ── AI ──────────────────────────────────────────────────────────────────────
-    const VOTE_CONF    = 0.6;   // MC confidence below this triggers a self-consistency vote
-    const VOTE_SAMPLES = 2;     // extra samples drawn when voting
-    const VOTE_TEMP    = 0.4;   // temperature for vote samples (diversity)
-
-    // Low-level single request to the background; cb receives the normalized response.
-    function requestAI(q, ans, image, extra, cb) {
-        const nudgeEl = document.getElementById("qa-nudge-input");
-        const nudge   = (nudgeEl?.value || "").trim();
-        const msg = { action: "askAI", question: q, answers: ans };
-        if (image) msg.imageDataUrl = image;
-        if (nudge) msg.nudge = nudge;
-        if (extra?.strict) msg.strict = true;
-        if (typeof extra?.temperature === "number") msg.temperature = extra.temperature;
-        runtimeSend(msg, cb);
-    }
-
-    // Normalize a background response into { fillText, reason, lowConfidence, confidence, inRange }.
-    // Structured answers are trusted; parseAnswer is the fallback for free-text / parse failures.
-    function resolveResp(resp, ans) {
-        if (resp && resp.answer && resp.inRange !== false) {
-            const conf = (typeof resp.confidence === "number") ? resp.confidence : null;
-            return {
-                fillText: resp.answer,
-                reason: clampReason(resp.reasoning || ""),
-                lowConfidence: conf != null ? conf < VOTE_CONF : false,
-                confidence: conf,
-                inRange: true
-            };
-        }
-        const p = parseAnswer((resp && resp.raw) || (resp && resp.answer) || "", ans);
-        return {
-            fillText: p.fillText, reason: p.reason, lowConfidence: true,
-            confidence: (resp && typeof resp.confidence === "number") ? resp.confidence : null,
-            inRange: false
-        };
-    }
-
-    function askAI(question, answers, imageDataUrl, autoFill, myId, strict) {
-        if (myId === undefined) myId = ++reqId;   // direct callers (manual scan) get a fresh id
-        const q    = question;
-        const ans  = answers || [];
-        const isMC = ans.length >= 2;
-        setStatus("asking");
-
-        const finish = (resolved, provider, usedImage) => {
-            if (myId !== reqId) return;
-            setStatus("answered");
-            showAnswer(null, provider, !!usedImage, false, autoFill, ans, resolved);
-        };
-
-        // Self-consistency vote — sample more times and majority-vote the option index.
-        const vote = (firstResp, usedImage) => {
-            const tally = {};
-            const record = r => {
-                const i = r && Number.isInteger(r.answerIndex) ? r.answerIndex : -1;
-                if (i >= 0) tally[i] = (tally[i] || 0) + 1;
-            };
-            record(firstResp);
-            let total = 1, pending = VOTE_SAMPLES;
-            const done = () => {
-                if (myId !== reqId) return;
-                let bestIdx = -1, bestCount = 0;
-                for (const k in tally) if (tally[k] > bestCount) { bestCount = tally[k]; bestIdx = +k; }
-                if (bestIdx >= 0) {
-                    finish({
-                        fillText: ans[bestIdx], reason: clampReason(firstResp.reasoning || ""),
-                        lowConfidence: bestCount <= total / 2, confidence: bestCount / total, inRange: true
-                    }, firstResp.provider, usedImage);
-                } else {
-                    finish(resolveResp(firstResp, ans), firstResp.provider, usedImage);
-                }
-            };
-            log("vote", { id: myId, samples: VOTE_SAMPLES });
-            for (let k = 0; k < VOTE_SAMPLES; k++) {
-                requestAI(q, ans, usedImage || null, { temperature: VOTE_TEMP }, r => {
-                    if (myId !== reqId) return;
-                    total++; record(r);
-                    if (--pending === 0) done();
-                });
-            }
-        };
-
-        const handle = (resp, usedImage) => {
-            if (myId !== reqId) return;
-            if (!resp || resp.error) {
-                log("err", { id: myId, error: resp?.error });
-                setStatus("error");
-                showError(resp?.error ?? "No response from AI");
-                return;
-            }
-            log("resp", { id: myId, ans: resp.answer, idx: resp.answerIndex, conf: resp.confidence, prov: resp.provider });
-
-            // Off-list / unparseable on MC → one strict retry (deterministic, temp 0).
-            if (isMC && !strict && (resp.parseError || resp.inRange === false)) {
-                askAI(q, ans, usedImage || null, autoFill, myId, true);
-                return;
-            }
-            const resolved = resolveResp(resp, ans);
-            // Genuinely uncertain MC → vote to raise the hit rate.
-            if (isMC && resolved.inRange && resolved.confidence != null && resolved.confidence < VOTE_CONF) {
-                vote(resp, usedImage);
-                return;
-            }
-            finish(resolved, resp.provider, usedImage);
-        };
-
-        const send = (image) => requestAI(q, ans, image, { strict }, resp => handle(resp, image));
-
-        if (imageDataUrl) {                       // image already captured (manual scan / re-ask)
-            showLoading("Reading the screenshot…");
-            log("call", { id: myId, mode: "vision-direct" });
-            send(imageDataUrl);
-            return;
-        }
-
-        if (needsVision(q)) {
-            showLoading("Reading the screenshot…");
-            log("call", { id: myId, mode: "visual" });
-            captureScreen((dataUrl, err) => {
-                if (myId !== reqId) return;
-                if (!dataUrl) { log("err", { id: myId, error: err, mode: "screenshot" }); send(null); return; }
-                log("call", { id: myId, mode: "vision+text", kb: Math.round(dataUrl.length / 1024) });
-                send(dataUrl);
-            });
-            return;
-        }
-
-        showLoading();
-        log("call", { id: myId, mode: "text" });
-        send(null);
-    }
-
-    // Manual scan — always passes autoFill=true so answer is applied automatically
-    function scanScreen(snapQ, snapA) {
-        cancelPendingGate();
-        const q   = snapQ !== undefined ? snapQ : overlayQuestion;
-        const ans = snapA !== undefined ? snapA : extractAnswers();
-        showLoading("Scanning screen…");
-        captureScreen((dataUrl, err) => {
-            if (dataUrl) {
-                askAI(q || "What is shown in this image?", ans, dataUrl, true);
-            } else {
-                setStatus("error");
-                showError(err || "Screenshot failed — check extension permissions");
+    // ╔══════════════════════════════════════════════════════════════════════════╗
+    // ║ Test hook — exposes internals to a test harness. Completely inert in a     ║
+    // ║ real browser, where `globalThis.__shejaTestHook` is never defined.         ║
+    // ╚══════════════════════════════════════════════════════════════════════════╝
+    if (typeof globalThis !== "undefined" && typeof globalThis.__shejaTestHook === "function") {
+        globalThis.__shejaTestHook({
+            // pure helpers
+            normalize, normKey, tokenOverlap, inViewport, isJunk, looksLikeQuestion,
+            dedupeQuestion, isBetterCandidate, compact, looksLikeOptionSuffix,
+            truncateAtQuestionMark, visualFingerprint, extractAnswers, findTextInput,
+            fillInput, simulateClick, liveOptionEls, clickableFrom, isLiveOption,
+            looksLikeVisualQuestion, isImageIrrelevantQuestion, needsVision,
+            scanForCurrentQuestion, classifyAnswerSurface,
+            startsWithWord, stripWrap, clampReason, closestOption, parseAnswer, resolveResp,
+            // classes
+            EventBus, CapturePipeline, Solver, AnswerFiller, OverlayUI,
+            IngestionEngine, TransitionSensor, EventLifecycleManager, Orchestrator,
+            // constants
+            constants: {
+                VOTE_CONF, VOTE_SAMPLES, VOTE_TEMP, DEBOUNCE_MS, DEBOUNCE_Q_MS,
+                GATE_INTERVAL_MS, GATE_MAX_MS, OPEN_GRACE_MS, RESET_COOLDOWN_MS,
+                LAYOUT_SHIFT_PX, TRANSITION_REFRACTORY_MS, VISUAL_POLL_MS, SUBMIT_RETRIES
             }
         });
     }
 
-    // ── Overlay mount & controls ───────────────────────────────────────────────
-    function applyQuestionVisibility() {
-        const qs  = document.getElementById("qa-question-section");
-        const os  = document.getElementById("qa-options-section");
-        const btn = document.getElementById("qa-toggle");
-        qs?.classList.toggle("qa-hidden", !questionVisible);
-        os?.classList.toggle("qa-hidden", !questionVisible);
-        if (btn) { btn.classList.toggle("qa-on", questionVisible); btn.setAttribute("aria-pressed", String(questionVisible)); }
+    // ╔══════════════════════════════════════════════════════════════════════════╗
+    // ║ Bootstrap                                                                  ║
+    // ╚══════════════════════════════════════════════════════════════════════════╝
+    let app = null;
+    function boot() {
+        if (app) return;
+        app = new Orchestrator();
+        app.start();
     }
-
-    function mountOverlay() {
-        if (!document.body) { setTimeout(mountOverlay, 200); return; }
-        if (document.body.contains(overlay)) return;
-
-        const head = document.head || document.documentElement;
-        if (!head.contains(overlayStyle)) head.appendChild(overlayStyle);
-        document.body.appendChild(overlay);
-        restorePosition();
-
-        overlay.querySelector("#qa-pause").addEventListener("click", () => {
-            isPaused = !isPaused;
-            const btn = document.getElementById("qa-pause");
-            btn.textContent = isPaused ? "▶" : "⏸";
-            btn.title = isPaused ? "Resume auto-detection" : "Pause auto-detection";
-            btn.setAttribute("aria-label", btn.title);
-            overlay.classList.toggle("qa-paused", isPaused);
-            if (isPaused) { cancelPendingGate(); setStatus("paused"); }
-            else setStatus("idle");
-        });
-
-        overlay.querySelector("#qa-close").addEventListener("click", () => {
-            observer.disconnect();
-            cancelPendingGate();
-            if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
-            overlay.remove();
-        });
-
-        overlay.querySelector("#qa-min").addEventListener("click", () => {
-            const c = document.getElementById("qa-content");
-            if (c) c.style.display = c.style.display === "none" ? "" : "none";
-        });
-
-        overlay.querySelector("#qa-toggle").addEventListener("click", () => {
-            questionVisible = !questionVisible;
-            applyQuestionVisibility();
-            sessionStorage.setItem("__sheja_showq", questionVisible ? "1" : "0");
-        });
-
-        const header = document.getElementById("qa-header");
-        header.addEventListener("mousedown", e => {
-            if (e.target.closest("#qa-controls")) return;
-            isDragging = true;
-            const rect = overlay.getBoundingClientRect();
-            dragX = e.clientX - rect.left;
-            dragY = e.clientY - rect.top;
-            overlay.style.top = rect.top + "px"; overlay.style.left = rect.left + "px";
-            overlay.style.right = "auto"; overlay.style.transform = "none";
-            overlay.classList.add("qa-dragging");
-            e.preventDefault();
-        });
-
-        overlay.querySelector("#qa-resize").addEventListener("mousedown", e => {
-            isResizing = true;
-            resizeStartX = e.clientX;
-            resizeStartY = e.clientY;
-            resizeStartW = overlay.offsetWidth;
-            const content = document.getElementById("qa-content");
-            resizeStartH = content ? content.offsetHeight : 300;
-            overlay.classList.add("qa-dragging");
-            e.preventDefault();
-            e.stopPropagation();
-        });
-
-        document.addEventListener("mousemove", e => {
-            if (isDragging) {
-                overlay.style.left = Math.max(0, Math.min(e.clientX - dragX, window.innerWidth  - overlay.offsetWidth))  + "px";
-                overlay.style.top  = Math.max(0, Math.min(e.clientY - dragY, window.innerHeight - overlay.offsetHeight)) + "px";
-            }
-            if (isResizing) {
-                const newW = Math.max(240, Math.min(window.innerWidth - 24, resizeStartW + (e.clientX - resizeStartX)));
-                const newH = Math.max(120, Math.min(window.innerHeight * 0.88, resizeStartH + (e.clientY - resizeStartY)));
-                overlay.style.width = newW + "px";
-                const content = document.getElementById("qa-content");
-                if (content) content.style.maxHeight = newH + "px";
-            }
-        });
-
-        document.addEventListener("mouseup", () => {
-            if (isDragging)  { isDragging  = false; overlay.classList.remove("qa-dragging"); savePosition(); }
-            if (isResizing)  { isResizing  = false; overlay.classList.remove("qa-dragging"); saveSize(); }
-        });
-
-        // Persistent rescan button — uses fresh DOM state at click time
-        overlay.querySelector("#qa-scan-main").addEventListener("click", () => {
-            const scannedQ = scanForCurrentQuestion();
-            const freshQ   = scannedQ || overlayQuestion;
-            const freshA   = extractAnswers();
-            const sameQ    = scannedQ && scannedQ === overlayQuestion;
-            const sameVis  = visualFingerprint() === overlayVisualKey;
-            const scanAns  = freshA.length >= 2 ? freshA : (sameQ && sameVis ? overlayAnswers : []);
-            scanScreen(freshQ, scanAns);
-        });
-
-        // Nudge panel toggle (closed by default)
-        overlay.querySelector("#qa-nudge-toggle").addEventListener("click", () => {
-            const panel = document.getElementById("qa-nudge-panel");
-            const btn   = document.getElementById("qa-nudge-toggle");
-            const open  = panel.classList.toggle("qa-hidden") === false;
-            btn.classList.toggle("qa-active", open);
-            if (open) document.getElementById("qa-nudge-input")?.focus();
-        });
-
-        // Save nudge to storage on change (debounced), update indicator
-        overlay.querySelector("#qa-nudge-input").addEventListener("input", () => {
-            updateNudgeIndicator();
-            clearTimeout(overlay._nudgeSave);
-            overlay._nudgeSave = setTimeout(() => {
-                chrome.storage.local.set({ nudgeHint: (document.getElementById("qa-nudge-input")?.value || "").trim() });
-            }, 600);
-        });
-
-        // Enter without Shift submits; Submit button also submits
-        overlay.querySelector("#qa-nudge-input").addEventListener("keydown", e => {
-            if (e.key !== "Enter" || e.shiftKey) return;
-            e.preventDefault();
-            submitNudge();
-        });
-        overlay.querySelector("#qa-nudge-submit").addEventListener("click", submitNudge);
-
-        // Clear button — wipes hint, keeps panel open
-        overlay.querySelector("#qa-nudge-clear").addEventListener("click", () => {
-            const input = document.getElementById("qa-nudge-input");
-            if (input) input.value = "";
-            clearTimeout(overlay._nudgeSave);
-            chrome.storage.local.set({ nudgeHint: "" });
-            updateNudgeIndicator();
-            input?.focus();
-        });
-
-        // Restore saved nudge hint and update indicator
-        chrome.storage.local.get("nudgeHint", data => {
-            const input = document.getElementById("qa-nudge-input");
-            if (input && data.nudgeHint) { input.value = data.nudgeHint; updateNudgeIndicator(); }
-        });
-    }
-
-    function closeNudgePanel() {
-        const panel = document.getElementById("qa-nudge-panel");
-        const btn   = document.getElementById("qa-nudge-toggle");
-        if (panel) panel.classList.add("qa-hidden");
-        if (btn)   btn.classList.remove("qa-active");
-    }
-
-    function updateNudgeIndicator() {
-        const btn   = document.getElementById("qa-nudge-toggle");
-        const input = document.getElementById("qa-nudge-input");
-        if (btn && input) btn.classList.toggle("qa-nudge-has-hint", !!input.value.trim());
-    }
-
-    // Save nudge, close panel, and immediately re-ask the current question with the hint.
-    function submitNudge() {
-        const input = document.getElementById("qa-nudge-input");
-        clearTimeout(overlay._nudgeSave);
-        if (input) chrome.storage.local.set({ nudgeHint: input.value.trim() });
-        updateNudgeIndicator();
-        closeNudgePanel();
-        if (!overlayQuestion) return;
-        cancelPendingGate();
-        const freshA = extractAnswers();
-        const ans = freshA.length >= 2 ? freshA : overlayAnswers;
-        showLoading("Re-asking with your hint…");
-        setStatus("asking");
-        askAI(overlayQuestion, ans, null, false);
-    }
-
-    function updateOverlay() {
-        mountOverlay();
-        closeNudgePanel();
-
-        const qEl  = document.getElementById("qa-question");
-        const tsEl = document.getElementById("qa-timestamp");
-        const oEl  = document.getElementById("qa-options");
-
-        if (qEl)  qEl.textContent  = overlayQuestion || "Waiting for a question…";
-        if (tsEl) tsEl.textContent = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-
-        if (oEl) {
-            oEl.innerHTML = "";
-            if (overlayAnswers.length) {
-                overlayAnswers.forEach(a => {
-                    const li = document.createElement("li");
-                    li.textContent = a;
-                    oEl.appendChild(li);
-                });
-            } else {
-                const li = document.createElement("li");
-                li.className = "qa-none";
-                li.textContent = "Open-ended — type your answer";
-                oEl.appendChild(li);
-            }
-        }
-
-        applyQuestionVisibility();
-
-        const ansEl = overlay.querySelector(".qa-section--answer");
-        if (ansEl) {
-            ansEl.classList.remove("qa-pulse");
-            requestAnimationFrame(() => ansEl.classList.add("qa-pulse"));
-        }
-
-        const cntEl = document.getElementById("qa-q-count");
-        if (cntEl) {
-            cntEl.style.display = questionCount > 0 ? "" : "none";
-            cntEl.textContent   = `#${questionCount}`;
-        }
-    }
-
-    // ── Question recording ─────────────────────────────────────────────────────
-    function cancelPendingGate() {
-        if (pendingGateTimer) { clearTimeout(pendingGateTimer); pendingGateTimer = null; }
-    }
-
-    // What can we answer against right now? mc = option buttons, open = free-text input,
-    // none = nothing rendered yet. Biased toward MC: a bare text input only counts as
-    // "open" after a grace period, so a lagging MC question isn't misread as open-ended.
-    function classifyAnswerSurface(question, elapsed) {
-        const btns = extractAnswers();
-        if (btns.length >= 2) return { kind: "mc", answers: btns };
-        if (isImageIrrelevantQuestion(question)) return { kind: "open", answers: [] };
-        if (findTextInput() && elapsed >= OPEN_GRACE_MS) return { kind: "open", answers: [] };
-        return { kind: "none", answers: [] };
-    }
-
-    // Poll until the answer surface exists, then dispatch the AI call exactly once.
-    function waitForAnswerSurface(question, myId, startedAt) {
-        if (myId !== reqId) return;                       // superseded by a newer question
-        const elapsed  = performance.now() - startedAt;
-        const surface  = classifyAnswerSurface(question, elapsed);
-        if (surface.kind !== "none") { dispatchAsk(question, surface, myId); return; }
-        if (elapsed >= GATE_MAX_MS) {                      // give up — best effort
-            const btns = extractAnswers();
-            dispatchAsk(question, btns.length >= 2 ? { kind: "mc", answers: btns } : { kind: "open", answers: [] }, myId);
-            return;
-        }
-        setStatus("waiting");
-        pendingGateTimer = setTimeout(() => waitForAnswerSurface(question, myId, startedAt), GATE_INTERVAL_MS);
-    }
-
-    function dispatchAsk(question, surface, myId) {
-        if (myId !== reqId) return;
-        pendingGateTimer = null;
-        overlayAnswers = surface.answers;                 // now authoritative
-        captureAnswerEls();                               // snapshot live option nodes for click-time
-        updateOverlay();
-        log("question", { q: question, opts: overlayAnswers, kind: surface.kind, count: questionCount });
-        askAI(question, overlayAnswers, null, false, myId);
-    }
-
-    function recordQuestion(questionText) {
-        if (isPaused) return;
-        const answers  = extractAnswers();
-        const question = truncateAtQuestionMark(dedupeQuestion(questionText), answers);
-        if (question.length < 8) return;
-        // If user already filled this question, block re-scans until question text changes
-        if (filledQuestion) {
-            if (question === filledQuestion) return;
-            filledQuestion = "";
-        }
-        // Cooldown only suppresses re-scans on the same question (result-screen noise).
-        if (Date.now() - lastAnswerAt < ANSWER_COOLDOWN && question === overlayQuestion) return;
-
-        const visualKey = needsVision(question) ? visualFingerprint() : "";
-        // Fingerprint excludes answers so a question seen first at [] then at [4 options]
-        // is ONE question, not two — the readiness gate handles option-waiting.
-        const fingerprint = question + "\n" + visualKey;
-        if (fingerprint === lastFingerprint) return;
-
-        lastFingerprint = fingerprint;   // claim immediately so gate-window re-entries short-circuit
-        const myId = ++reqId;            // gate owns the request id now
-        cancelPendingGate();
-        questionCount++;
-
-        overlayQuestion  = question;
-        overlayVisualKey = visualKey;
-        overlayAnswers   = answers.length >= 2 ? answers : [];   // provisional; gate finalizes
-        updateOverlay();
-        setStatus("detecting");
-        showLoading("Reading question…");
-        waitForAnswerSurface(question, myId, performance.now());
-    }
-
-    // ── Question detection ─────────────────────────────────────────────────────
-    function processText(raw) {
-        const text = normalize(raw);
-        if (text.length < 8 || text.length > 300 || isJunk(text) || !looksLikeQuestion(text)) return;
-
-        const deduped = dedupeQuestion(text);
-        const clean = truncateAtQuestionMark(deduped, deduped.includes("?") ? extractAnswers() : []);
-
-        if (clean.length < 8 || clean.trim().split(/\s+/).length < 3) return;
-        if (isBetterCandidate(clean, candidateQ)) candidateQ = clean;
-    }
-
-    function scheduleFlush() {
-        if (candidateTimer) clearTimeout(candidateTimer);
-        // A "?"-terminated candidate is a complete question → flush fast. Option-waiting
-        // is handled separately by the readiness gate, so an early flush is safe.
-        const delay = candidateQ.trim().endsWith("?") ? DEBOUNCE_Q_MS : DEBOUNCE_MS;
-        candidateTimer = setTimeout(() => {
-            const q    = candidateQ;
-            candidateQ = "";
-            candidateTimer = null;
-            if (q) recordQuestion(q);
-        }, delay);
-    }
-
-    // RAF-batched MutationObserver — collects all text changes in one frame before processing
-    const mutationBatch = new Set();
-    let rafPending = false;
-
-    function processBatch() {
-        rafPending = false;
-        for (const text of mutationBatch) processText(text);
-        mutationBatch.clear();
-        if (candidateQ) scheduleFlush();
-    }
-
-    const observer = new MutationObserver(mutations => {
-        for (const m of mutations) {
-            if (m.type === "characterData") {
-                const p = m.target.parentElement;
-                if (!p?.closest("#qa-overlay")) mutationBatch.add(normalize(m.target.textContent || ""));
-            } else {
-                for (const node of m.addedNodes) {
-                    if (node.nodeType === Node.TEXT_NODE && !node.parentElement?.closest("#qa-overlay")) {
-                        mutationBatch.add(normalize(node.textContent || ""));
-                    } else if (node.nodeType === Node.ELEMENT_NODE && !node.closest?.("#qa-overlay")) {
-                        mutationBatch.add(normalize(node.textContent || ""));
-                    }
-                }
-            }
-        }
-        if (!rafPending && mutationBatch.size > 0) {
-            rafPending = true;
-            requestAnimationFrame(processBatch);
-        }
-    });
-
-    // Stored so we can stop everything when the overlay is closed
-    let pollInterval = null;
-
-    // Interval poll — catches answer-option changes when question text stays the same
-    // (e.g. quiz.com reuses "Guess the country?" for every flag question)
-    function startPoll() {
-        pollInterval = setInterval(() => {
-            const current = extractAnswers();
-            const freshQ = scanForCurrentQuestion() || overlayQuestion;
-            const currentVisualKey = needsVision(freshQ) ? visualFingerprint() : "";
-            const sameAnswers = current.join("|") === overlayAnswers.join("|");
-            const sameVisual = currentVisualKey === overlayVisualKey;
-            if (!overlayQuestion) return;
-            if ((current.length < 2 && !currentVisualKey) || (sameAnswers && sameVisual)) return;
-            if (freshQ) recordQuestion(freshQ);
-        }, POLL_MS);
-    }
-
-    // ── Bootstrap ──────────────────────────────────────────────────────────────
-    function start() {
-        mountOverlay();
-        observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
-        startPoll();
-    }
-
-    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start);
-    else start();
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
+    else boot();
 
 })();

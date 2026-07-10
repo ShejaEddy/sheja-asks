@@ -60,6 +60,29 @@ powered by the AI provider of your choice (Claude, OpenAI, Gemini, or Mistral).
 Chrome Extension (Manifest V3) · content script + background service worker ·
 vanilla JS, no build step · `chrome.storage.local` for settings.
 
+The content script is organised as modular ES6 classes over a small event bus:
+`IngestionEngine` (DOM + visual question capture), `TransitionSensor` (predictive
+next-question detection), `EventLifecycleManager` (click-driven reset),
+`CapturePipeline` (screenshots), `Solver` (AI calls + self-consistency vote),
+`AnswerFiller` (click/type/submit), `OverlayUI` (view), and an `Orchestrator` that
+wires them together with single-flight back-pressure.
+
+## Testing
+
+The suite runs on macOS's built-in JavaScriptCore — no Node or install step. It
+stands up a fake DOM + `chrome` API, loads `content.js`, and exercises every pure
+helper plus each module's behaviour (question detection, readiness gate, vote,
+strict retry, vision routing, back-pressure, transition/reset lifecycle).
+
+```sh
+# from the project root
+osascript -l JavaScript tests/content.test.js
+```
+
+Exits non-zero if any assertion fails (150+ assertions). `content.js` exposes its
+internals to the suite only when `globalThis.__shejaTestHook` is defined, which
+never happens in a real browser — so the test hook is inert in production.
+
 ## Privacy
 
 Question text (and, for visual questions, a screenshot of the active tab) is sent to

@@ -14,9 +14,13 @@ const PROVIDER_NAMES = {
 
 const MAX_TOKENS = 512;   // room for the reasoning field, still cheap on small/fast models
 
+// Quality tuning: 75% is a sweet spot for speed while retaining text legibility
+const SCREENSHOT_QUALITY = 75;
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg.action === "takeScreenshot") {
-        chrome.tabs.captureVisibleTab(null, { format: "jpeg", quality: 85 }, dataUrl => {
+        // Use format: "jpeg" with tunable quality for fast encoding
+        chrome.tabs.captureVisibleTab(null, { format: "jpeg", quality: SCREENSHOT_QUALITY }, dataUrl => {
             if (chrome.runtime.lastError) sendResponse({ error: chrome.runtime.lastError.message });
             else sendResponse({ dataUrl });
         });
