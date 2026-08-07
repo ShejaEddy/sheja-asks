@@ -1200,6 +1200,7 @@
             this._currentQuestion = "";
             this._currentOptions = [];
             this._currentVisualKey = "";
+            this._pendingVisualKey = "";        // see _visualTick's visual-only debounce
             // MutationObserver — rAF-batched so we process at most once per frame.
             this._batch = new Set();            // deduped text this frame
             this._pendingTexts = [];            // recycled scratch array (GC-friendly)
@@ -1253,6 +1254,7 @@
             this._batch.clear();
             this._pendingTexts.length = 0;
             this._lastFingerprint = "";
+            this._pendingVisualKey = "";
         }
 
         // After an answer is chosen: suppress the exact just-answered question until it
@@ -1346,8 +1348,26 @@
             const sameAnswers = current.join("|") === this._currentOptions.join("|");
             const sameVisual = currentVisualKey === this._currentVisualKey;
             // Nothing actionable, or nothing changed (e.g. a decorative image swap).
-            if ((current.length < 2 && !currentVisualKey) || (sameAnswers && sameVisual)) return;
-            // A new flag with the SAME question text, or new options → re-detect.
+            if ((current.length < 2 && !currentVisualKey) || (sameAnswers && sameVisual)) {
+                this._pendingVisualKey = "";   // stable again — clear any half-confirmed flap
+                return;
+            }
+            // A visual-only change (same options, only the image fingerprint differs) has to
+            // show up on TWO CONSECUTIVE polls before we act on it. visualFingerprint() keys off
+            // img src/currentSrc, and some sites re-render that element with a churning src
+            // (cache-busted URL, srcset re-resolution, …) for the SAME still-on-screen image —
+            // reacting to a single-tick flicker re-runs the whole solve, including a fresh
+            // screenshot + AI call, for a question that never actually changed. That's exactly
+            // what stacks up into several-second delays on flag/image questions. A genuinely
+            // new image is still on screen ~150ms later (one more poll), so this costs real
+            // detection nothing while filtering out the flap. Option changes are a much
+            // stronger signal (real new DOM content, not just a src string) and still act
+            // immediately, undebounced.
+            if (sameAnswers && !sameVisual) {
+                if (this._pendingVisualKey !== currentVisualKey) { this._pendingVisualKey = currentVisualKey; return; }
+            } else {
+                this._pendingVisualKey = "";
+            }
             this._tryRecord(freshQ);
         }
 

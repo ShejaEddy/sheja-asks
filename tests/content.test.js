@@ -551,6 +551,48 @@ test('suppressCurrent is idempotent — a redundant call does not blank a valid 
     eng.suppressCurrent();                  // e.g. a double-click on an already-filled answer
     eq('ie6b', eng._suppressed, fp);         // still the real fingerprint, not ""
 });
+test('_visualTick debounces a visual-only flap — needs 2 consecutive polls before it re-detects', () => {
+    resetDOM();
+    DOM.buttons = [mkEl('button', { text: 'France' }), mkEl('button', { text: 'Spain' })];
+    DOM.imgs = [Object.assign(
+        mkEl('img', { rect: R({ width: 300, height: 200, top: 60, bottom: 260 }) }),
+        { src: 'flag2.png', currentSrc: 'flag2.png' }
+    )];
+    var bus = busRec(); var eng = new A.IngestionEngine(bus);
+    eng._running = true;
+    eng._currentQuestion = 'Guess the flag shown?';
+    eng._currentOptions = ['France', 'Spain'];       // unchanged → sameAnswers stays true throughout
+    eng._currentVisualKey = 'img:flag1.png';         // the fingerprint already confirmed/shown
+    eng._lastFingerprint = 'Guess the flag shown?\nimg:flag1.png';
+
+    eng._lastPollAt = 0;                             // bypass the poll throttle
+    eng._visualTick(0);                              // 1st sighting of the new src — not enough alone
+    eq('vt1a', eng._pendingVisualKey, 'img:flag2.png');
+    eq('vt1b', bus._log.filter(x => x.e === 'questionDetected').length, 0);
+
+    eng._lastPollAt = 0;
+    eng._visualTick(0);                              // 2nd, CONFIRMING sighting → acts
+    var d = bus._log.filter(x => x.e === 'questionDetected');
+    eq('vt1c', d.length, 1);
+    eq('vt1d', d[0].p.visualKey, 'img:flag2.png');
+});
+test('_visualTick never confirms a src that keeps alternating (no re-detect, no stuck state)', () => {
+    resetDOM();
+    DOM.buttons = [mkEl('button', { text: 'France' }), mkEl('button', { text: 'Spain' })];
+    var toggle = false;
+    var img = mkEl('img', { rect: R({ width: 300, height: 200, top: 60, bottom: 260 }) });
+    Object.defineProperty(img, 'currentSrc', { get() { toggle = !toggle; return toggle ? 'a.png' : 'b.png'; } });
+    DOM.imgs = [img];
+    var bus = busRec(); var eng = new A.IngestionEngine(bus);
+    eng._running = true;
+    eng._currentQuestion = 'Guess the flag shown?';
+    eng._currentOptions = ['France', 'Spain'];
+    eng._currentVisualKey = 'img:seed.png';
+    eng._lastFingerprint = 'Guess the flag shown?\nimg:seed.png';
+
+    for (var i = 0; i < 4; i++) { eng._lastPollAt = 0; eng._visualTick(0); }
+    eq('vt2', bus._log.filter(x => x.e === 'questionDetected').length, 0);
+});
 
 group('TransitionSensor');
 test('sensor emits on loader rising edge only', () => {
