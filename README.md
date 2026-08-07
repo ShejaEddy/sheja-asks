@@ -71,7 +71,7 @@ wires them together with single-flight back-pressure.
 
 Two suites run on macOS's built-in JavaScriptCore — no Node or install step. They
 stand up a fake DOM + `chrome` API, load the real scripts, and assert against their
-actual internals (~275 assertions total).
+actual internals (~285 assertions total).
 
 ```sh
 # from the project root
@@ -84,8 +84,10 @@ Both exit non-zero if any assertion fails. Coverage includes:
 - **Unit** — every pure helper (`parseAnswer`, `dedupeQuestion`, `truncateAtQuestionMark`,
   `needsVision`, `extractAnswers`, `classifyAnswerSurface`, …).
 - **Behaviour** — each module: EventBus, Solver (vote / strict retry / vision routing),
-  AnswerFiller, IngestionEngine (gate + dedup + suppression), TransitionSensor,
-  EventLifecycleManager, Orchestrator.
+  AnswerFiller, IngestionEngine (gate + dedup + suppression, idempotent on a repeat click),
+  TransitionSensor, EventLifecycleManager, Orchestrator (resets the overlay to idle on
+  every applied answer — MC or open-ended, single or repeated click — without clobbering
+  a new question that started loading mid-fill).
 - **Design decisions** — locked in by name: fingerprint excludes options, `needsVision`
   by wording not image presence, MC never types into an input, transition preserves the
   in-flight solve (only an answer cancels), single-flight back-pressure.

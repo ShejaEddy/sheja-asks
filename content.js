@@ -30,8 +30,10 @@
     const LOG_KEY          = "__quiz_logs";
     const MAX_LOGS         = 500;
     const DEBOUNCE_MS      = 300;   // settle time after last DOM change (incomplete stems)
-    const DEBOUNCE_Q_MS    = 120;   // faster flush for a "?"-terminated (complete) question
-    const VISUAL_POLL_MS   = 250;   // rAF-throttled cadence for the visual/option loop
+    const DEBOUNCE_Q_MS    = 80;    // faster flush for a "?"-terminated (complete) question
+    const VISUAL_POLL_MS   = 150;   // rAF-throttled cadence for the visual/option loop — catches
+                                     // the next question sooner; already skipped mid-capture, so
+                                     // polling more often here doesn't reopen the freeze fix
     const IMG_WAIT_MS      = 800;   // max wait for flag images to finish loading
     const SCREENSHOT_SETTLE_MS = 40; // paint settle after hiding the overlay, before capture
     const SCREENSHOT_POLL_MS   = 80; // re-check cadence while waiting for images to load
@@ -43,12 +45,15 @@
     const CAPTURE_FADE_OUT_MS = 30;
     const CAPTURE_FADE_IN_MS  = 180;
     const AUTOFILL_MS      = 700;   // delay before auto-fill on manual rescan
-    const SUBMIT_INIT_MS   = 400;   // delay before first submit attempt (lets selection register)
-    const SUBMIT_RETRY_MS  = 350;   // delay between submit retries
+    // Submit timing: short first attempt + short retry cadence. Safe to trim because
+    // autoSubmit() already RETRIES (SUBMIT_RETRIES times) if the button isn't ready yet —
+    // shortening the fixed wait only shaves latency off the common case where it already is.
+    const SUBMIT_INIT_MS   = 150;   // delay before first submit attempt (lets selection register)
+    const SUBMIT_RETRY_MS  = 250;   // delay between submit retries
     const SUBMIT_RETRIES   = 4;
     const RESET_COOLDOWN_MS = 200;  // suppress re-detection immediately after an answer click
     // Answer-surface readiness gate — wait for options/input before calling the AI
-    const GATE_INTERVAL_MS = 150;   // re-check cadence while waiting for the answer surface
+    const GATE_INTERVAL_MS = 100;   // re-check cadence while waiting for the answer surface
     const GATE_MAX_MS      = 5000;  // give up waiting and call best-effort after this
     const OPEN_GRACE_MS    = 700;   // grace before treating a text input as "open-ended"
     // TransitionSensor tuning
@@ -1252,8 +1257,15 @@
 
         // After an answer is chosen: suppress the exact just-answered question until it
         // changes; a genuinely new question still comes through immediately.
+        //
+        // Idempotent by construction: _lastFingerprint is blanked below, so a REDUNDANT call
+        // (e.g. the user clicking an already-filled answer a second time, or both the
+        // lifecycleReset listener and onFill's own suppressCurrent() firing for the same
+        // click) sees an empty _lastFingerprint and leaves the real _suppressed value alone
+        // instead of clobbering it with "" — which would silently disable suppression and let
+        // the same just-answered question re-trigger a fresh AI call.
         suppressCurrent() {
-            this._suppressed = this._lastFingerprint;
+            if (this._lastFingerprint) this._suppressed = this._lastFingerprint;
             this._cooldownUntil = performance.now() + RESET_COOLDOWN_MS;
             this._lastFingerprint = "";
             this._cancelGate();
@@ -1614,23 +1626,37 @@
         }
 
         // An answer was chosen (by us or the user) — the user has moved on, so abandon any
-        // in-flight solve for this question rather than waste an answer they won't use.
+        // in-flight solve for this question rather than waste an answer they won't use, AND
+        // reset the overlay to idle right away so we're visibly ready for the next question
+        // instead of leaving the just-answered card (accent, badge, reasoning) lingering
+        // until the next question happens to render. Previously this reset only ran when a
+        // solve was still in flight, so clicking an option on an already-answered question
+        // left stale content on screen.
         onReset() {
             log("reset", {});
             this._lastAnswerAt = Date.now();
-            if (this._loading) {
-                this.reqId++;
-                this._loading = false;
-                this.overlay.setStatus("idle");
-                this.overlay.showIdle("Answer selected.");
-            }
+            if (this._loading) { this.reqId++; this._loading = false; }
+            this.overlay.setStatus("idle");
+            this.overlay.showIdle("Answer selected.");
+            this.overlay.clearAnswerAccent();
         }
 
         // Apply the AI's answer to the page. suppressCurrent() also covers open-ended,
-        // where no page answer-click fires the lifecycle reset.
+        // where no page answer-click fires the lifecycle reset — and for the same reason
+        // (open-ended has no matching lifecycleReset click) we reset the overlay here too,
+        // not just in onReset(). Guarded on !_loading so this can't clobber a NEW question's
+        // "Thinking…" if one started detecting in the moment between showAnswer and the click.
         onFill(fillText, isMC) {
             return this.filler.fill(fillText, isMC).then(ok => {
-                if (ok) { this.ingestion.suppressCurrent(); this._lastAnswerAt = Date.now(); }
+                if (ok) {
+                    this.ingestion.suppressCurrent();
+                    this._lastAnswerAt = Date.now();
+                    if (!this._loading) {
+                        this.overlay.setStatus("idle");
+                        this.overlay.showIdle("Answer selected.");
+                        this.overlay.clearAnswerAccent();
+                    }
+                }
                 return ok;
             });
         }

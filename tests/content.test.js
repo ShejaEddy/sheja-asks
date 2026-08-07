@@ -541,6 +541,16 @@ test('ingestion paused ignores detection', () => {
     eng.setPaused(true); eng._tryRecord('Should be ignored while paused?');
     eq('ie5', bus._log.filter(x => x.e === 'questionDetected').length, 0);
 });
+test('suppressCurrent is idempotent — a redundant call does not blank a valid suppression', () => {
+    resetDOM(); DOM.buttons = [mkEl('button', { text: 'A' }), mkEl('button', { text: 'B' })];
+    var bus = busRec(); var eng = new A.IngestionEngine(bus);
+    eng._tryRecord('Some question here?');
+    var fp = eng._lastFingerprint;
+    eng.suppressCurrent();
+    eq('ie6a', eng._suppressed, fp);
+    eng.suppressCurrent();                  // e.g. a double-click on an already-filled answer
+    eq('ie6b', eng._suppressed, fp);         // still the real fingerprint, not ""
+});
 
 group('TransitionSensor');
 test('sensor emits on loader rising edge only', () => {
@@ -662,6 +672,45 @@ await atest('orchestrator onFill suppresses re-detection', async () => {
     var ok1 = await app.onFill('Blue', true);
     ok('or6a', ok1);
     ok('or6b', app.ingestion._suppressed === 'Blue?\n', 'ingestion should suppress the answered fingerprint');
+});
+test('orchestrator onReset resets the overlay to idle even when nothing was loading', () => {
+    installEnv();
+    var app = new A.Orchestrator(); app.start();
+    var idleCalls = 0, statusLog = [], accentCalls = 0;
+    app.overlay.showIdle = () => idleCalls++;
+    app.overlay.setStatus = s => statusLog.push(s);
+    app.overlay.clearAnswerAccent = () => accentCalls++;
+    app._loading = false;              // answer already shown; nothing in flight — the previous gap
+    app.onReset({});
+    eq('or7a', idleCalls, 1);
+    ok('or7b', statusLog.indexOf('idle') !== -1);
+    eq('or7c', accentCalls, 1);
+});
+await atest('orchestrator onFill resets the overlay to idle on success (covers open-ended, no lifecycleReset)', async () => {
+    installEnv();
+    var app = new A.Orchestrator(); app.start();
+    DOM.inputs = [mkEl('input', { type: 'text', rect: R({ width: 200, height: 30 }) })];
+    var idleCalls = 0, accentCalls = 0;
+    app.overlay.showIdle = () => idleCalls++;
+    app.overlay.clearAnswerAccent = () => accentCalls++;
+    app._loading = false;
+    var ok1 = await app.onFill('Mercury', false);   // open-ended: fillInput, not a page click
+    ok('or8a', ok1);
+    eq('or8b', idleCalls, 1);
+    eq('or8c', accentCalls, 1);
+});
+await atest('orchestrator onFill does NOT clobber a new question that started loading mid-fill', async () => {
+    installEnv();
+    var app = new A.Orchestrator(); app.start();
+    DOM.buttons = [mkEl('button', { text: 'Blue' }), mkEl('button', { text: 'Submit' })];
+    app.filler.capture();
+    var idleCalls = 0;
+    app.overlay.showIdle = () => idleCalls++;
+    var p = app.onFill('Blue', true);
+    app._loading = true;               // a NEW question began detecting before onFill resolved
+    var ok1 = await p;
+    ok('or9a', ok1);
+    eq('or9b', idleCalls, 0);          // must not stomp the new question's "Thinking…" state
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
