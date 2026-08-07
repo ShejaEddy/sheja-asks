@@ -518,13 +518,26 @@ test('ingestion suppresses just-answered, allows new', () => {
     eng._tryRecord('A completely different question?');          // new → emits
     eq('ie2b', bus._log.filter(x => x.e === 'questionDetected').length, 2);
 });
-test('ingestion reset clears fingerprint (re-emits same)', () => {
+test('ingestion reset does NOT re-emit the SAME already-confirmed question (false-positive transition)', () => {
+    // reset() fires on a predicted transition, which is a heuristic guess, not a certainty.
+    // If the guess was wrong and the exact same question/image is still on screen, recording
+    // it again would restart the whole pipeline — readiness gate, AI call, and for vision
+    // questions a fresh screenshot — for content that never changed. That's what turned one
+    // flag/image question into several seconds of repeated solves.
     resetDOM(); DOM.buttons = [mkEl('button', { text: 'A' }), mkEl('button', { text: 'B' })];
     var bus = busRec(); var eng = new A.IngestionEngine(bus);
     eng._tryRecord('Repeatable question text here?');
     eng.reset();
-    eng._tryRecord('Repeatable question text here?');
-    eq('ie3', bus._log.filter(x => x.e === 'questionDetected').length, 2);
+    eng._tryRecord('Repeatable question text here?');           // false positive: nothing actually changed
+    eq('ie3', bus._log.filter(x => x.e === 'questionDetected').length, 1);
+});
+test('ingestion reset still allows a GENUINELY new question through right after (real transition)', () => {
+    resetDOM(); DOM.buttons = [mkEl('button', { text: 'A' }), mkEl('button', { text: 'B' })];
+    var bus = busRec(); var eng = new A.IngestionEngine(bus);
+    eng._tryRecord('First question here please?');
+    eng.reset();
+    eng._tryRecord('A totally different second question?');    // real transition: content changed
+    eq('ie3b', bus._log.filter(x => x.e === 'questionDetected').length, 2);
 });
 test('ingestion gate timeout → best-effort open emit', () => {
     resetDOM(); // no buttons, no input
