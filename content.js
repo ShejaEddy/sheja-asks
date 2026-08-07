@@ -1245,8 +1245,10 @@
         setPaused(p) { this._paused = p; }
 
         // Full pipeline reset (on a predicted transition) — drop buffers so the NEXT
-        // question is captured cleanly; clear the fingerprint so a still-visible question
-        // can recover if the transition was a false positive.
+        // question is captured cleanly; clear _lastFingerprint so a GENUINELY new question
+        // isn't blocked by stale dedup state. If the transition turns out to have been a
+        // false positive (same question still on screen), _tryRecord's own check against
+        // _currentQuestion/_currentVisualKey catches that and skips re-emitting — see there.
         reset() {
             this._candidateQ = "";
             if (this._candidateTimer) { clearTimeout(this._candidateTimer); this._candidateTimer = null; }
