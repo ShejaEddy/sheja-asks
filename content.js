@@ -1385,7 +1385,22 @@
             const fingerprint = question + "\n" + visualKey;
             if (fingerprint === this._suppressed) return;      // just-answered, unchanged
             this._suppressed = "";                             // any different question clears suppression
-            if (fingerprint === this._lastFingerprint) return; // dedupe
+            if (fingerprint === this._lastFingerprint) return; // dedupe within this detection cycle
+
+            // reset() (fired on a PREDICTED transition — a heuristic, not a certainty) clears
+            // _lastFingerprint so a genuinely new question isn't blocked by stale dedup state.
+            // But if what's on screen turns out to be exactly the question we already
+            // confirmed (_currentQuestion/_currentVisualKey, set the last time we actually
+            // emitted), the transition was a false positive, not a new question. Falling
+            // through here would re-run the WHOLE pipeline — readiness gate, AI call, and for
+            // vision questions a fresh screenshot — for content that never changed, which is
+            // exactly what turns one flag/image question into several seconds of repeated
+            // solves. Resync _lastFingerprint (rather than just returning) so the very next
+            // real change still fires normally.
+            if (fingerprint === this._currentQuestion + "\n" + this._currentVisualKey) {
+                this._lastFingerprint = fingerprint;
+                return;
+            }
 
             this._lastFingerprint = fingerprint;               // claim immediately (re-entry short-circuits)
             const seq = ++this._detectSeq;
