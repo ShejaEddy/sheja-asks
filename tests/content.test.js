@@ -710,6 +710,73 @@ await atest('screenshot fast path: one frame, one image scan, no polling', async
     eq('pf2b', _rafs, 1);        // exactly one requestAnimationFrame (the redundant 2nd was removed)
     eq('pf2c', IMG_SCANS, 1);    // single image scan; no ~80ms poll retries
 });
+await atest('screenshot defers hiding the overlay until the image-wait resolves, not on an earlier "still loading" poll', async () => {
+    installEnv();
+    var hideCalls = 0, showCalls = 0, hideAtCheck = -1, checkCount = 0;
+    var img = mkEl('img', { rect: R({ width: 300, height: 200 }) });
+    // "still loading" on the 1st read, "done" on the 2nd — forces one genuine poll cycle.
+    Object.defineProperty(img, 'complete', { get() { checkCount++; return checkCount > 1; } });
+    DOM.imgs = [img];
+    var cap = new A.CapturePipeline({
+        hide() { hideCalls++; hideAtCheck = checkCount; },
+        show() { showCalls++; }
+    });
+    var res = await cap.capture();
+    ok('pf3a', res.dataUrl && res.dataUrl.indexOf('data:image') === 0);
+    eq('pf3b', hideCalls, 1);
+    eq('pf3c', showCalls, 1);
+    ok('pf3d', checkCount >= 2);          // the image really was seen as "still loading" at least once
+    eq('pf3e', hideAtCheck, checkCount);  // hide() only fires on the resolving check — never on an earlier pending one
+});
+
+group('PERFORMANCE — quiet during native screenshot capture');
+// Chrome's native tab-capture forces a compositor readback of the whole page; our own
+// layout-forcing polls (IngestionEngine Plan B, TransitionSensor) running on the same
+// thread at that exact moment compound the visible freeze (and, downstream, make any
+// page-side countdown skip ahead). captureStart/captureEnd bracket the capture window
+// so both pollers go quiet for it — these tests lock that in.
+test('IngestionEngine skips the visual poll while captureStart is active, resumes on captureEnd', () => {
+    resetDOM();
+    var bus = busRec();
+    var eng = new A.IngestionEngine(bus);
+    eng.start();                                       // wires captureStart/captureEnd
+    eng._currentQuestion = 'Old question already on screen?';
+    eng._currentOptions = ['A', 'B'];
+
+    bus.emit('captureStart');
+    ok('cap1a', eng._capturing === true);
+    resetCounters();
+    DOM.buttons = [mkEl('button', { text: 'C' }), mkEl('button', { text: 'D' })];  // a new surface appears
+    eng._lastPollAt = 0;                                // bypass the poll throttle for this call
+    eng._visualTick(0);
+    eq('cap1b', RECT_CALLS, 0);                         // no layout-forcing reads while capturing
+    eq('cap1c', bus._log.filter(x => x.e === 'questionDetected').length, 0);
+
+    bus.emit('captureEnd');
+    ok('cap1d', eng._capturing === false);
+    eng._lastPollAt = 0;
+    eng._visualTick(0);
+    ok('cap1e', RECT_CALLS > 0);                        // capture over → polling resumes normally
+});
+test('TransitionSensor skips loader/layout polling while captureStart is active, resumes on captureEnd', () => {
+    resetDOM();
+    var bus = busRec();
+    var s = new A.TransitionSensor(bus);
+    s.start();                                          // wires captureStart/captureEnd
+
+    bus.emit('captureStart');
+    ok('cap2a', s._capturing === true);
+    resetCounters();
+    DOM.loaders = [mkEl('div', { rect: R() })];         // would normally be a rising-edge emit
+    s._tick();
+    eq('cap2b', RECT_CALLS, 0);
+    eq('cap2c', bus._log.filter(x => x.e === 'transitionStart').length, 0);
+
+    bus.emit('captureEnd');
+    ok('cap2d', s._capturing === false);
+    s._tick();
+    eq('cap2e', bus._log.filter(x => x.e === 'transitionStart').length, 1);   // resumes, catches it
+});
 
 // ══════════════════════════════════════════════════════════════════════════════
 // DESIGN DECISIONS — lock in the architectural choices behind the rewrite

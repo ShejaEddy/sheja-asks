@@ -517,24 +517,35 @@
         constructor({ hide, show }) { this._hide = hide; this._show = show; }
 
         // Resolves { dataUrl, error }. Waits (up to IMG_WAIT_MS) for large images to
-        // finish loading, hides the overlay so it isn't in the shot, then delegates
+        // finish loading, THEN hides the overlay so it isn't in the shot, and delegates
         // JPEG encoding to the background script.
         //
+        // UX: the overlay (with its "Reading the screenshot…" spinner) stays fully visible
+        // and live through the image-wait — hide() only fires right before the actual shot.
+        // The old code hid it for the ENTIRE capture (up to IMG_WAIT_MS + native-capture
+        // time), which reads as the extension itself freezing/vanishing for the better part
+        // of a second. Now the invisible window is just one paint frame + settle + the
+        // native chrome.tabs.captureVisibleTab round trip — the part that genuinely can't
+        // be shortened, not the part we were free to keep visible.
+        //
         // PERF: the common case (text/logo questions where the large images are already
-        // decoded) takes ONE image scan and fires after a single paint frame + settle —
-        // no polling. Only genuinely-loading images incur the ~80ms re-check loop, and
-        // the old redundant second requestAnimationFrame is gone (one frame is enough for
-        // the overlay-hide to paint), shaving a frame off every capture.
+        // decoded) takes ONE image scan and fires immediately — no polling, no upfront
+        // frame wait (nothing is hidden yet, so there's nothing to wait on a paint for).
+        // Only genuinely-loading images incur the ~80ms re-check loop, and the one
+        // unavoidable requestAnimationFrame is spent right before the hide, where it's
+        // actually needed (so the hide paints before the native capture reads the frame).
         capture() {
             return new Promise(resolve => {
-                this._hide();
                 const deadline = Date.now() + IMG_WAIT_MS;
-                const fire = () => setTimeout(() => {
-                    runtimeSend({ action: "takeScreenshot" }, resp => {
-                        this._show();
-                        resolve({ dataUrl: resp?.dataUrl || null, error: resp?.error || null });
-                    });
-                }, SCREENSHOT_SETTLE_MS);
+                const fire = () => {
+                    this._hide();
+                    requestAnimationFrame(() => setTimeout(() => {
+                        runtimeSend({ action: "takeScreenshot" }, resp => {
+                            this._show();
+                            resolve({ dataUrl: resp?.dataUrl || null, error: resp?.error || null });
+                        });
+                    }, SCREENSHOT_SETTLE_MS));
+                };
                 const check = () => {
                     const pending = [...document.querySelectorAll("img")].some(img => {
                         if (img.closest("#" + OVERLAY_ID) || img.complete) return false;
@@ -544,7 +555,7 @@
                     if (!pending || Date.now() >= deadline) fire();
                     else setTimeout(check, SCREENSHOT_POLL_MS);
                 };
-                requestAnimationFrame(check);   // one frame so the hidden overlay paints
+                check();   // overlay stays visible through the wait; we only go dark right before the shot
             });
         }
     }
@@ -1166,6 +1177,15 @@
             this._raf = null;
             this._lastPollAt = 0;
             this._running = false;
+            // True for the (short) window a screenshot is actually being captured — see
+            // CapturePipeline. Chrome's native tab-capture forces a compositor readback of
+            // the whole page; running our own layout-forcing DOM scans (extractAnswers,
+            // scanForCurrentQuestion, visualFingerprint) on the SAME thread at that exact
+            // moment competes with it and visibly deepens the freeze the user sees (which in
+            // turn makes any page-side countdown/timer skip ahead). Skipping this poll for
+            // that one short window removes the contention without weakening detection —
+            // Plan A (MutationObserver) stays live throughout as the safety net.
+            this._capturing = false;
         }
 
         start() {
@@ -1173,6 +1193,8 @@
             this._observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
             this.bus.on("transitionStart", () => this.reset());
             this.bus.on("lifecycleReset", () => this.suppressCurrent());
+            this.bus.on("captureStart", () => { this._capturing = true; });
+            this.bus.on("captureEnd", () => { this._capturing = false; });
             this._raf = requestAnimationFrame(t => this._visualTick(t));
         }
 
@@ -1276,7 +1298,7 @@
             const now = performance.now();
             if (now - this._lastPollAt < VISUAL_POLL_MS) return;   // throttle real work
             this._lastPollAt = now;
-            if (this._paused || !this._currentQuestion || now < this._cooldownUntil) return;
+            if (this._paused || !this._currentQuestion || now < this._cooldownUntil || this._capturing) return;
 
             const current = extractAnswers();
             const freshQ = scanForCurrentQuestion() || this._currentQuestion;
@@ -1348,8 +1370,13 @@
             this._loaderWasPresent = false;
             this._lastH = null; this._lastW = null;
             this._refractoryUntil = 0;
+            this._capturing = false;   // see IngestionEngine._capturing — same reasoning
         }
-        start() { this._interval = setInterval(() => this._tick(), TRANSITION_POLL_MS); }
+        start() {
+            this._interval = setInterval(() => this._tick(), TRANSITION_POLL_MS);
+            this.bus.on("captureStart", () => { this._capturing = true; });
+            this.bus.on("captureEnd", () => { this._capturing = false; });
+        }
         stop()  { if (this._interval) { clearInterval(this._interval); this._interval = null; } }
 
         _container() { return document.querySelector("main, article, [role='main']") || document.body; }
@@ -1372,6 +1399,7 @@
         }
 
         _tick() {
+            if (this._capturing) return;   // don't fight the native screenshot for the main thread
             // Primary, reliable signal: a loader/skeleton appearing (rising edge).
             const loader = this._loaderPresent();
             if (loader && !this._loaderWasPresent) this._emit("loader");
@@ -1439,9 +1467,13 @@
                 onNudgeSubmit: () => this.onNudgeSubmit(),
                 onFill:        (t, isMC) => this.onFill(t, isMC)
             });
+            // captureStart/captureEnd bracket the ENTIRE native-capture window (overlay-hide
+            // through image-wait through the actual chrome.tabs.captureVisibleTab round trip)
+            // so IngestionEngine/TransitionSensor can go quiet for that one short stretch —
+            // see their _capturing fields for why.
             this.capture = new CapturePipeline({
-                hide: () => this.overlay.setHidden(true),
-                show: () => this.overlay.setHidden(false)
+                hide: () => { this.overlay.setHidden(true); this.bus.emit("captureStart"); },
+                show: () => { this.overlay.setHidden(false); this.bus.emit("captureEnd"); }
             });
             this.solver = new Solver({ capture: this.capture, getNudge: () => this.overlay.getNudge() });
             this.filler = new AnswerFiller();
