@@ -402,6 +402,29 @@ await atest('filler.fill MC no target → false', async () => {
     ok('af6', ok1 === false);
 });
 
+group('OverlayUI — capture fade');
+function mkOverlay() {
+    var ui = new A.OverlayUI({ onClose() {}, onPauseToggle() {}, onRescan() {}, onNudgeSubmit() {}, onFill() {} });
+    ui.mount();
+    return ui;
+}
+test('setHidden(true) fades out fast, without an abrupt visibility cut', () => {
+    var ui = mkOverlay();
+    ui.setHidden(true);
+    eq('oh1a', ui.overlay.style.opacity, '0');
+    eq('oh1b', ui.overlay.style.pointerEvents, 'none');
+    ok('oh1c', ui.overlay.style.transition.indexOf(A.constants.CAPTURE_FADE_OUT_MS + 'ms') !== -1);
+});
+test('setHidden(false) fades back in, restoring interaction', () => {
+    var ui = mkOverlay();
+    ui.setHidden(true);
+    ui.setHidden(false);
+    eq('oh2a', ui.overlay.style.opacity, '1');
+    eq('oh2b', ui.overlay.style.visibility, '');
+    eq('oh2c', ui.overlay.style.pointerEvents, '');
+    ok('oh2d', ui.overlay.style.transition.indexOf(A.constants.CAPTURE_FADE_IN_MS + 'ms') !== -1);
+});
+
 group('Solver');
 function mkSolver() {
     var cap = new A.CapturePipeline({ hide() {}, show() {} });

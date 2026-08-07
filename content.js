@@ -35,6 +35,13 @@
     const IMG_WAIT_MS      = 800;   // max wait for flag images to finish loading
     const SCREENSHOT_SETTLE_MS = 40; // paint settle after hiding the overlay, before capture
     const SCREENSHOT_POLL_MS   = 80; // re-check cadence while waiting for images to load
+    // Overlay hide/show around a capture is an opacity fade, not a hard visibility cut, so it
+    // reads as one smooth motion instead of a blink. The fade-out MUST finish before the
+    // native shot fires — it does, with margin: CapturePipeline waits one rAF frame +
+    // SCREENSHOT_SETTLE_MS (~56ms) between hide() and the actual chrome.tabs.captureVisibleTab
+    // call. The fade-in has no such deadline, so it's a touch slower and purely cosmetic.
+    const CAPTURE_FADE_OUT_MS = 30;
+    const CAPTURE_FADE_IN_MS  = 180;
     const AUTOFILL_MS      = 700;   // delay before auto-fill on manual rescan
     const SUBMIT_INIT_MS   = 400;   // delay before first submit attempt (lets selection register)
     const SUBMIT_RETRY_MS  = 350;   // delay between submit retries
@@ -775,6 +782,7 @@
             this.handlers = handlers;                 // { onClose, onPauseToggle, onRescan, onNudgeSubmit, onFill }
             this._questionVisible = false;
             this._fadeTimer = null;
+            this._hideTimer = null;   // pending visibility flip after a capture-hide fade — see setHidden
             this._filling = false;
             this._isDragging = false; this._dragX = 0; this._dragY = 0;
             this._isResizing = false; this._rsX = 0; this._rsY = 0; this._rsW = 0; this._rsH = 0;
@@ -837,7 +845,27 @@
             if (card) card.classList.remove("qa-state-ok", "qa-state-warn", "qa-state-err");
         }
         setPausedVisual(paused) { this.overlay?.classList.toggle("qa-paused", paused); }
-        setHidden(hidden) { if (this.overlay) this.overlay.style.visibility = hidden ? "hidden" : ""; }
+        // Fades the overlay out/in for a screenshot capture — see CAPTURE_FADE_*_MS. opacity
+        // (not visibility) is what keeps it out of the shot's pixels either way, so animating
+        // it is safe; visibility itself only flips once the fade-out has actually finished,
+        // so the overlay drops out of the a11y tree/tab order without an abrupt jump.
+        setHidden(hidden) {
+            if (!this.overlay) return;
+            clearTimeout(this._hideTimer);
+            if (hidden) {
+                this.overlay.style.pointerEvents = "none";
+                this.overlay.style.transition = `opacity ${CAPTURE_FADE_OUT_MS}ms ease-out`;
+                this.overlay.style.opacity = "0";
+                this._hideTimer = setTimeout(() => {
+                    if (this.overlay) this.overlay.style.visibility = "hidden";
+                }, CAPTURE_FADE_OUT_MS);
+            } else {
+                this.overlay.style.visibility = "";
+                this.overlay.style.pointerEvents = "";
+                this.overlay.style.transition = `opacity ${CAPTURE_FADE_IN_MS}ms ease-out`;
+                this.overlay.style.opacity = "1";
+            }
+        }
 
         // Fades #qa-ai out, rebuilds via buildFn, fades in. Cancels any pending fade so a
         // stale question can't overwrite a newer one.
@@ -2009,7 +2037,8 @@
             constants: {
                 VOTE_CONF, VOTE_SAMPLES, VOTE_TEMP, DEBOUNCE_MS, DEBOUNCE_Q_MS,
                 GATE_INTERVAL_MS, GATE_MAX_MS, OPEN_GRACE_MS, RESET_COOLDOWN_MS,
-                LAYOUT_SHIFT_PX, TRANSITION_REFRACTORY_MS, VISUAL_POLL_MS, SUBMIT_RETRIES
+                LAYOUT_SHIFT_PX, TRANSITION_REFRACTORY_MS, VISUAL_POLL_MS, SUBMIT_RETRIES,
+                SCREENSHOT_SETTLE_MS, CAPTURE_FADE_OUT_MS, CAPTURE_FADE_IN_MS
             }
         });
     }

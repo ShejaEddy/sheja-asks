@@ -71,7 +71,7 @@ wires them together with single-flight back-pressure.
 
 Two suites run on macOS's built-in JavaScriptCore — no Node or install step. They
 stand up a fake DOM + `chrome` API, load the real scripts, and assert against their
-actual internals (~265 assertions total).
+actual internals (~275 assertions total).
 
 ```sh
 # from the project root
@@ -91,10 +91,10 @@ Both exit non-zero if any assertion fails. Coverage includes:
   in-flight solve (only an answer cancels), single-flight back-pressure.
 - **Performance guards** — fail if an optimization is reverted: `visualFingerprint` reads
   each image's rect ≤ once, screenshot fast path uses one frame + one image scan, the
-  overlay is only hidden right before the actual shot (not for the whole image-wait), and
-  both `IngestionEngine` and `TransitionSensor` go quiet for that native-capture window so
-  their own layout-forcing polls don't compound the freeze `chrome.tabs.captureVisibleTab`
-  already causes.
+  overlay is only hidden right before the actual shot (not for the whole image-wait), it
+  fades rather than snaps in/out of a capture, and both `IngestionEngine` and
+  `TransitionSensor` go quiet for that native-capture window so their own layout-forcing
+  polls don't compound the freeze `chrome.tabs.captureVisibleTab` already causes.
 - **Prompt design** — which type-hints fire (negation, superlative, ordering, matching,
   year, anagram, …) and that hints accumulate.
 
