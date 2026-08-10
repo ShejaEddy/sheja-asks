@@ -30,7 +30,23 @@
     const LOG_KEY          = "__quiz_logs";
     const MAX_LOGS         = 500;
     const DEBOUNCE_MS      = 300;   // settle time after last DOM change (incomplete stems)
-    const DEBOUNCE_Q_MS    = 80;    // faster flush for a "?"-terminated (complete) question
+    // "?"-terminated text used to flush much faster (80ms) on the assumption that a stem
+    // ending in "?" is already the final, stable text. Confirmed via logs that on quiz.com
+    // that assumption is wrong: EVERY question observed runs a decorative scroll/reveal
+    // animation that rewrites the DOM every ~150-180ms for over a second, and each
+    // in-between fragment still legitimately ends in "?". 80ms is shorter than that gap, so
+    // the debounce fired on almost every animation frame instead of waiting for it to
+    // settle. DEBOUNCE_Q_MS now matches DEBOUNCE_MS — safely longer than the observed
+    // cadence, so each new fragment properly RESETS the pending flush (clearTimeout in
+    // _scheduleFlush) and it only fires once the rewrites actually stop.
+    const DEBOUNCE_Q_MS    = 300;
+    // Some quiz pages run a decorative scroll/reveal animation over the question text,
+    // rewriting the DOM to a shrinking trailing substring of the real text before it
+    // resettles (confirmed via logs: ~12 rewrites over ~1.3s for one plain-text question,
+    // each one legitimately "looking like a question" since it keeps the trailing "?").
+    // RECENT_BEST_WINDOW_MS is how long a longer candidate "protects" against a shorter one
+    // that's just a trailing suffix of it — see IngestionEngine._processText.
+    const RECENT_BEST_WINDOW_MS = 2000;
     const VISUAL_POLL_MS   = 150;   // rAF-throttled cadence for the visual/option loop — catches
                                      // the next question sooner; already skipped mid-capture, so
                                      // polling more often here doesn't reopen the freeze fix
@@ -44,18 +60,46 @@
     // call. The fade-in has no such deadline, so it's a touch slower and purely cosmetic.
     const CAPTURE_FADE_OUT_MS = 30;
     const CAPTURE_FADE_IN_MS  = 180;
-    const AUTOFILL_MS      = 700;   // delay before auto-fill on manual rescan
+    const AUTOFILL_MS      = 700;   // delay before auto-fill on manual rescan/nudge — lets you see the answer first
+    const AUTOANSWER_MS    = 150;   // delay before auto-fill on the main automatic flow — just enough to settle
     // Submit timing: short first attempt + short retry cadence. Safe to trim because
     // autoSubmit() already RETRIES (SUBMIT_RETRIES times) if the button isn't ready yet —
     // shortening the fixed wait only shaves latency off the common case where it already is.
     const SUBMIT_INIT_MS   = 150;   // delay before first submit attempt (lets selection register)
     const SUBMIT_RETRY_MS  = 250;   // delay between submit retries
     const SUBMIT_RETRIES   = 4;
+    // A simulated click doesn't guarantee the page's own JS registered it as a selection —
+    // see looksSelected()/findSubmitButton(). AnswerFiller re-clicks immediately whenever it
+    // has clear negative evidence (a submit button that's still disabled), for up to this
+    // total budget, before giving up and leaving the manual click as a fallback.
+    const SELECT_CONFIRM_BUDGET_MS = 2000;
+    const SELECT_CONFIRM_POLL_MS   = 150;  // pause after a click before checking whether it "took"
+    // Hard cap alongside the time budget above — ~13 retries covers 2s at the poll cadence
+    // with margin. Belt-and-suspenders: the loop should never realistically need this many,
+    // but bounding by COUNT (not just wall-clock time) means it can never run away regardless
+    // of clock/timer behavior.
+    const SELECT_CONFIRM_MAX_TRIES = 20;
+    // Confirmed via logs: on a platform with no Try/Submit button at all (click = submit,
+    // e.g. quiz.com's MC), there's no negative evidence to retry on EITHER — findSubmitButton
+    // finds nothing, so the old code treated "no signal in any direction" as success and
+    // silently never actually selected anything. A few quick extra clicks (not the full
+    // SELECT_CONFIRM_BUDGET_MS/MAX_TRIES budget, which is for when we DO have clear negative
+    // evidence) catch simple one-off timing flakiness without paying the full budget's
+    // latency on every question when there's no way to tell success from failure anyway.
+    const SELECT_BLIND_RETRIES = 3;
     const RESET_COOLDOWN_MS = 200;  // suppress re-detection immediately after an answer click
     // Answer-surface readiness gate — wait for options/input before calling the AI
     const GATE_INTERVAL_MS = 100;   // re-check cadence while waiting for the answer surface
     const GATE_MAX_MS      = 5000;  // give up waiting and call best-effort after this
     const OPEN_GRACE_MS    = 700;   // grace before treating a text input as "open-ended"
+    // Confirmed via logs: on a page whose answer input is slow to become detectable (long
+    // question text still mid-reveal, lazy hydration, …), findTextInput() can fail for the
+    // ENTIRE gate window, meaning every such question hit the full GATE_MAX_MS timeout before
+    // the AI was ever asked — 5 full seconds of pure waiting, not screenshot/AI time. The AI
+    // call itself doesn't need the input to exist yet (only the later fill step does, and
+    // AnswerFiller retries finding it there) — OPEN_FALLBACK_MS caps how long we'll wait
+    // specifically for that input before asking anyway, well short of the full gate timeout.
+    const OPEN_FALLBACK_MS = 2000;
     // TransitionSensor tuning
     const TRANSITION_POLL_MS       = 50;   // layout-shift sampling cadence (spec: 50ms)
     const LAYOUT_SHIFT_PX          = 50;   // dimension delta that counts as a transition
@@ -296,6 +340,13 @@
 
     // Full pointer+mouse sequence (so React handlers register) plus a native click()
     // fallback, after bringing the element into view and focusing it.
+    // A PointerEvent constructed with no pointerId/pointerType/isPrimary/button defaults to
+    // values ("", false, ambiguous button state) that don't describe a real mouse click —
+    // some pointer-events-aware component libraries validate these and silently ignore an
+    // event that doesn't look like a genuine device interaction, which reads as "the click
+    // did nothing" with zero error/feedback anywhere. Filling them in (and separating
+    // button-down/button-up state properly across the down/up pair) makes the synthetic
+    // sequence describe an actual left-click from a real mouse instead of a bare pointer.
     function simulateClick(el) {
         if (!el) return;
         try { el.scrollIntoView({ block: "center", inline: "center" }); } catch (e) {}
@@ -303,10 +354,16 @@
         const r  = el.getBoundingClientRect();
         const cx = r.left + r.width  / 2;
         const cy = r.top  + r.height / 2;
-        const opts = { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy };
-        ["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach(type =>
-            el.dispatchEvent(new (type.startsWith("pointer") ? PointerEvent : MouseEvent)(type, opts))
-        );
+        const base = {
+            bubbles: true, cancelable: true, composed: true, view: window,
+            clientX: cx, clientY: cy, screenX: cx, screenY: cy
+        };
+        const pointer = { ...base, pointerId: 1, pointerType: "mouse", isPrimary: true };
+        el.dispatchEvent(new PointerEvent("pointerdown", { ...pointer, button: 0, buttons: 1 }));
+        el.dispatchEvent(new MouseEvent("mousedown",     { ...base, button: 0, buttons: 1 }));
+        el.dispatchEvent(new PointerEvent("pointerup",   { ...pointer, button: 0, buttons: 0 }));
+        el.dispatchEvent(new MouseEvent("mouseup",       { ...base, button: 0, buttons: 0 }));
+        el.dispatchEvent(new MouseEvent("click",         { ...base, button: 0, buttons: 0, detail: 1 }));
         try { el.click(); } catch (e) {}   // quiz.com options are select-one → a 2nd click is safe
     }
 
@@ -326,6 +383,34 @@
         if (!el || !el.isConnected || el.closest("#" + OVERLAY_ID) || el.disabled) return false;
         const r = el.getBoundingClientRect();
         return r.width >= 40 && r.height >= 18 && inViewport(r, 4);
+    }
+
+    // Best-effort "does this element look selected" check — a simulated click doesn't
+    // guarantee the page's own JS actually registered it as a selection (wrong element,
+    // an event handler that ignores synthetic events, timing), so AnswerFiller uses this
+    // (plus findSubmitButton) to decide whether a click needs retrying rather than just
+    // assuming success. Covers common ARIA + class-naming conventions; a false negative
+    // here only costs a harmless re-click (quiz.com's select-one options are safe to
+    // re-click), so it's fine if a given site's real markup isn't covered.
+    function looksSelected(el) {
+        if (!el) return false;
+        if (el.getAttribute("aria-pressed")  === "true") return true;
+        if (el.getAttribute("aria-checked")  === "true") return true;
+        if (el.getAttribute("aria-selected") === "true") return true;
+        return /\b(selected|is-selected|is-active|is-chosen|is-checked)\b/i.test(el.className || "");
+    }
+
+    // The visible Try/Submit/Check button, if any — regardless of its disabled state (a
+    // caller wanting to CLICK it should check `!el.disabled` itself; AnswerFiller's post-
+    // click confirmation check specifically wants to see a still-disabled button, since
+    // that's what "selection didn't register" looks like on a gated quiz platform).
+    function findSubmitButton() {
+        return [...document.querySelectorAll("button")].find(el => {
+            if (el.closest("#" + OVERLAY_ID)) return false;
+            if (!inViewport(el.getBoundingClientRect())) return false;
+            const t = normalize(el.innerText || el.textContent || "").toLowerCase();
+            return ["try", "submit", "check"].some(w => t === w || t.startsWith(w + " "));
+        }) || null;
     }
 
     function looksLikeVisualQuestion(q) {
@@ -386,6 +471,11 @@
         if (btns.length >= 2) return { kind: "mc", answers: btns };
         if (isImageIrrelevantQuestion(question)) return { kind: "open", answers: [] };
         if (findTextInput() && elapsed >= OPEN_GRACE_MS) return { kind: "open", answers: [] };
+        // No MC options and no detectable input yet, but we've already waited long enough
+        // that this is very unlikely to still be a lagging MC render — stop blocking the AI
+        // call on the input specifically finishing rendering. AnswerFiller's own retry loop
+        // finds it once it does; this just stops wasting the gap in between.
+        if (elapsed >= OPEN_FALLBACK_MS) return { kind: "open", answers: [] };
         return { kind: "none", answers: [] };
     }
 
@@ -546,14 +636,21 @@
         // Only genuinely-loading images incur the ~80ms re-check loop, and the one
         // unavoidable requestAnimationFrame is spent right before the hide, where it's
         // actually needed (so the hide paints before the native capture reads the frame).
+        // DIAGNOSTIC LOGGING (temporary): shot_start/shot_done bracket every real capture,
+        // with elapsed ms and whether it errored (e.g. captureVisibleTab's ~2/sec rate
+        // limit). Compare shot_start timestamps across a session's logs to see how many
+        // captures actually fire per visible question, and how long each one takes.
         capture() {
             return new Promise(resolve => {
-                const deadline = Date.now() + IMG_WAIT_MS;
+                const t0 = Date.now();
+                log("shot_start", {});
+                const deadline = t0 + IMG_WAIT_MS;
                 const fire = () => {
                     this._hide();
                     requestAnimationFrame(() => setTimeout(() => {
                         runtimeSend({ action: "takeScreenshot" }, resp => {
                             this._show();
+                            log("shot_done", { ms: Date.now() - t0, ok: !!resp?.dataUrl, err: resp?.error || null });
                             resolve({ dataUrl: resp?.dataUrl || null, error: resp?.error || null });
                         });
                     }, SCREENSHOT_SETTLE_MS));
@@ -676,11 +773,13 @@
             });
         }
 
-        clickAnswer(text) {
+        // Single-pass fuzzy match (no click) — exact key, then prefix/substring, then token
+        // overlap. Returns the live element or null.
+        _matchSingle(text) {
             const want = normKey(text);
-            if (!want) return false;
+            if (!want) return null;
             const stored = this._answerEls.get(want);
-            if (isLiveOption(stored)) { simulateClick(clickableFrom(stored)); return true; }
+            if (isLiveOption(stored)) return stored;
 
             const cands = liveOptionEls().map(el => ({ el, key: normKey(el.textContent || "") })).filter(c => c.key);
             let m =
@@ -693,67 +792,155 @@
                 for (const c of cands) { const s = tokenOverlap(c.key, want); if (s > bestScore) { bestScore = s; best = c; } }
                 m = best;
             }
-            if (m) { simulateClick(clickableFrom(m.el)); return true; }
+            return m ? m.el : null;
+        }
+
+        // Multi-strategy match: exact → no leading article → no punctuation. Separated from
+        // clicking so fill()'s confirm-retry loop can re-click the SAME resolved element on
+        // each retry instead of re-running text-matching every time.
+        _matchOption(text) {
+            return this._matchSingle(text) ||
+                this._matchSingle(text.replace(/^(the|a|an)\s+/i, "").trim()) ||
+                this._matchSingle(text.replace(/[.,!?;:'"()]/g, "").trim());
+        }
+
+        clickAnswer(text) {
+            const el = this._matchSingle(text);
+            if (el) { simulateClick(clickableFrom(el)); return true; }
             return false;
         }
 
         // Multi-strategy click: exact → no leading article → no punctuation.
         _attemptClick(t) {
-            if (this.clickAnswer(t)) return true;
-            const noArticle = t.replace(/^(the|a|an)\s+/i, "").trim();
-            if (noArticle !== t && this.clickAnswer(noArticle)) return true;
-            const noPunct = t.replace(/[.,!?;:'"()]/g, "").trim();
-            if (noPunct !== t && this.clickAnswer(noPunct)) return true;
+            const el = this._matchOption(t);
+            if (el) { simulateClick(clickableFrom(el)); return true; }
             return false;
         }
 
         // Apply an answer. Promise resolves true on success. MC only ever clicks an
         // option (retries while buttons render, never types into a page search box);
         // open-ended types into the input, falling back to a button.
+        //
+        // A simulated click landing doesn't mean the page's own JS treated it as a
+        // selection — so once an option is found and clicked, this looks for POSITIVE
+        // confirmation: the options getting locked (the clicked one disabled, or fewer live
+        // options than before), an ARIA/class selected state, or a Try/Submit button that's
+        // enabled. Three outcomes:
+        //   - confirmed → done, submit.
+        //   - a Try/Submit button exists and is STILL disabled → clear negative evidence,
+        //     re-click right away, for up to SELECT_CONFIRM_BUDGET_MS.
+        //   - no button exists at all and nothing looks locked either → no signal in EITHER
+        //     direction (confirmed via logs: quiz.com's MC has no Try/Submit button — click
+        //     IS the submit — so this used to be silently treated as success even when the
+        //     click plainly never registered on the page). A few quick SELECT_BLIND_RETRIES
+        //     catch simple one-off timing flakiness without paying the full confirm budget
+        //     on every question when we fundamentally can't tell success from failure here.
+        // Gives up and resolves false only on the clear-negative-evidence path, so the
+        // answer stays un-struck-through and a manual click still works.
         fill(fillText, isMC) {
             return new Promise(resolve => {
                 if (isMC) {
-                    let tries = 0;
+                    let findTries = 0;
+                    let confirmTries = 0;
+                    let blindTries = 0;
+                    let confirmDeadline = null;   // set once something's actually been clicked
                     const tryClick = () => {
-                        if (this._attemptClick(fillText)) {
-                            log("fill", { ans: fillText, method: "click_btn" });
-                            setTimeout(() => this.autoSubmit(), SUBMIT_INIT_MS);
-                            resolve(true); return;
+                        const el = this._matchOption(fillText);
+                        if (!el) {
+                            if (++findTries < 8) { setTimeout(tryClick, 200); return; }
+                            log("fill", { ans: fillText, method: "no_btn", tries: findTries });
+                            resolve(false);
+                            return;
                         }
-                        if (++tries < 8) { setTimeout(tryClick, 200); return; }
-                        log("fill", { ans: fillText, method: "no_btn", tries });
-                        resolve(false);
+                        if (confirmDeadline === null) confirmDeadline = Date.now() + SELECT_CONFIRM_BUDGET_MS;
+                        const preLiveCount = liveOptionEls().length;
+                        simulateClick(clickableFrom(el));
+                        confirmTries++;
+                        setTimeout(() => {
+                            const btn = findSubmitButton();
+                            const locked = el.disabled || liveOptionEls().length < preLiveCount;
+                            const confirmed = locked || looksSelected(el) || (!!btn && !btn.disabled);
+                            if (confirmed) {
+                                log("fill", { ans: fillText, method: "click_btn", tries: confirmTries, blindTries });
+                                setTimeout(() => this.autoSubmit(), SUBMIT_INIT_MS);
+                                resolve(true);
+                                return;
+                            }
+                            const definitelyFailed = !!btn && btn.disabled;
+                            if (definitelyFailed && Date.now() < confirmDeadline && confirmTries < SELECT_CONFIRM_MAX_TRIES) {
+                                tryClick();   // submit's still disabled — didn't register, retry now
+                                return;
+                            }
+                            if (!btn && blindTries < SELECT_BLIND_RETRIES) {
+                                blindTries++;
+                                tryClick();   // no signal either way — a couple more quick tries
+                                return;
+                            }
+                            log("fill", { ans: fillText, method: definitelyFailed ? "click_unconfirmed" : "click_no_signal", tries: confirmTries, blindTries });
+                            if (definitelyFailed) { resolve(false); return; }
+                            setTimeout(() => this.autoSubmit(), SUBMIT_INIT_MS);   // best effort — no way to tell either way
+                            resolve(true);
+                        }, SELECT_CONFIRM_POLL_MS);
                     };
                     tryClick();
                     return;
                 }
-                const input = findTextInput();
-                if (input) {
-                    log("fill", { ans: fillText, method: "fill_input" });
+                // Open-ended: find the input (RETRYING if it isn't there yet — confirmed via
+                // logs that a page whose input is slow to render/become detectable made
+                // findTextInput() fail for the entire readiness-gate window; without a retry
+                // here too, one failed lookup fell straight to "no_target" and gave up, no
+                // second chance, unlike the MC button lookup above which already retried).
+                // Once found, type into it and VERIFY the value actually stuck before
+                // trusting it enough to submit — a controlled component (React/Vue/etc.) can
+                // silently reject or revert a programmatic value if something about the
+                // synthetic input/change event doesn't satisfy it; the old code just waited
+                // 60ms and clicked Submit regardless, which is exactly what "typed the right
+                // answer but submitted as if nothing was entered" looks like. input.value
+                // matching what we set is the confirmation signal — always available, no
+                // markup guessing needed.
+                let findTries = 0;
+                let fillTries = 0;
+                let fillDeadline = null;
+                const tryFill = input => {
                     fillInput(input, fillText);
-                    setTimeout(() => this.autoSubmit(), 60);
-                    resolve(true);
-                } else if (this._attemptClick(fillText)) {
-                    log("fill", { ans: fillText, method: "click_btn" });
-                    setTimeout(() => this.autoSubmit(), SUBMIT_INIT_MS);
-                    resolve(true);
-                } else {
-                    log("fill", { ans: fillText, method: "no_target" });
-                    resolve(false);
-                }
+                    fillTries++;
+                    if (fillDeadline === null) fillDeadline = Date.now() + SELECT_CONFIRM_BUDGET_MS;
+                    setTimeout(() => {
+                        const stuck = normalize(input.value || "") === normalize(fillText);
+                        if (stuck) {
+                            log("fill", { ans: fillText, method: "fill_input", tries: fillTries });
+                            setTimeout(() => this.autoSubmit(), SUBMIT_INIT_MS);
+                            resolve(true);
+                        } else if (fillTries < SELECT_CONFIRM_MAX_TRIES && Date.now() < fillDeadline) {
+                            tryFill(input);   // value didn't stick — retry right away
+                        } else {
+                            log("fill", { ans: fillText, method: "fill_unconfirmed", tries: fillTries });
+                            resolve(false);
+                        }
+                    }, SELECT_CONFIRM_POLL_MS);
+                };
+                const tryFind = () => {
+                    const input = findTextInput();
+                    if (input) { tryFill(input); return; }
+                    if (++findTries < 8) { setTimeout(tryFind, 200); return; }
+                    if (this._attemptClick(fillText)) {
+                        log("fill", { ans: fillText, method: "click_btn" });
+                        setTimeout(() => this.autoSubmit(), SUBMIT_INIT_MS);
+                        resolve(true);
+                    } else {
+                        log("fill", { ans: fillText, method: "no_target", tries: findTries });
+                        resolve(false);
+                    }
+                };
+                tryFind();
             });
         }
 
         // Retries — quiz.com sometimes takes a moment to enable the Try/Submit button.
         autoSubmit(retries) {
             if (retries === undefined) retries = SUBMIT_RETRIES;
-            const btn = [...document.querySelectorAll("button")].find(el => {
-                if (el.closest("#" + OVERLAY_ID) || el.disabled) return false;
-                if (!inViewport(el.getBoundingClientRect())) return false;
-                const t = normalize(el.innerText || el.textContent || "").toLowerCase();
-                return ["try", "submit", "check"].some(w => t === w || t.startsWith(w + " "));
-            });
-            if (btn) { log("submit", { label: normalize(btn.textContent || "") }); simulateClick(btn); return; }
+            const btn = findSubmitButton();
+            if (btn && !btn.disabled) { log("submit", { label: normalize(btn.textContent || "") }); simulateClick(btn); return; }
             const input = findTextInput();
             if (input) {
                 log("submit", { method: "enter" });
@@ -765,7 +952,7 @@
                 return;
             }
             if (retries > 0) setTimeout(() => this.autoSubmit(retries - 1), SUBMIT_RETRY_MS);
-            else log("submit", { method: "none" });
+            else log("submit", { method: "none", sawDisabledBtn: !!btn });
         }
     }
 
@@ -951,9 +1138,10 @@
             if (cntEl) { cntEl.style.display = count > 0 ? "" : "none"; cntEl.textContent = `#${count}`; }
         }
 
-        // Present a resolved answer. `autoFill` clicks it automatically after a delay
-        // (manual rescan); otherwise the user clicks the answer text to apply it.
-        showAnswer(resolved, provider, usedImage, autoFill, options) {
+        // Present a resolved answer. `autoFillMs` (a delay in ms, or falsy to disable) clicks
+        // it automatically once that delay has passed; the answer text is always ALSO
+        // clickable regardless, so a failed/skipped auto-fill still has a manual fallback.
+        showAnswer(resolved, provider, usedImage, autoFillMs, options) {
             const NAMES = { claude: "Claude", openai: "ChatGPT", gemini: "Gemini", mistral: "Mistral" };
             const { fillText, reason, lowConfidence, confidence } = resolved;
             const isMC = options.length >= 2;
@@ -1014,19 +1202,34 @@
                     h.textContent = "📝 Open-ended — click the answer to type it in."; wrap.appendChild(h);
                 }
 
-                if (autoFill) setTimeout(requestFill, AUTOFILL_MS);
+                if (autoFillMs) setTimeout(requestFill, autoFillMs);
                 el.appendChild(wrap);
             });
         }
 
+        // Marks the currently-shown answer as applied (strikethrough) WITHOUT replacing the
+        // card — used when a fill succeeds via a path that doesn't hold the text element
+        // itself (auto-fill, or Orchestrator.onFill's own success handler). Keeps the actual
+        // chosen answer visible and readable so you can still see it, rather than a generic
+        // "done" message that hides what was picked and reads as final — you can still click
+        // a different option on the page to override it.
+        markAnswerFilled() {
+            const el = this.overlay?.querySelector(".qa-answer-text");
+            if (el) el.classList.add("qa-filled");
+        }
+
         // Route a fill request through the controller; strike the answer through on success.
+        // Always clears _filling, even if onFill unexpectedly throws/rejects — without the
+        // catch, one exception anywhere in the fill chain left _filling stuck true forever,
+        // silently swallowing every further click (including a manual retry) until the next
+        // question replaced the card.
         _requestFill(textEl, fillText, isMC) {
             if (this._filling) return;
             this._filling = true;
-            Promise.resolve(this.handlers.onFill(fillText, isMC)).then(ok => {
-                this._filling = false;
-                if (ok) textEl.classList.add("qa-filled");
-            });
+            Promise.resolve(this.handlers.onFill(fillText, isMC))
+                .then(ok => { if (ok) textEl.classList.add("qa-filled"); })
+                .catch(e => log("bus_err", { evt: "onFill", error: String(e) }))
+                .then(() => { this._filling = false; });
         }
 
         // ── Nudge panel ──
@@ -1191,6 +1394,8 @@
             // Detection state
             this._candidateQ = "";
             this._candidateTimer = null;
+            this._recentBestQ = "";              // longest complete-looking candidate seen
+            this._recentBestAt = 0;              // recently — see _processText
             this._lastFingerprint = "";
             this._suppressed = "";              // just-answered fingerprint (skip until it changes)
             this._cooldownUntil = 0;
@@ -1200,7 +1405,7 @@
             this._currentQuestion = "";
             this._currentOptions = [];
             this._currentVisualKey = "";
-            this._pendingVisualKey = "";        // see _visualTick's visual-only debounce
+            this._pendingVisualKey = "";        // see _tryRecord's visual-only debounce
             // MutationObserver — rAF-batched so we process at most once per frame.
             this._batch = new Set();            // deduped text this frame
             this._pendingTexts = [];            // recycled scratch array (GC-friendly)
@@ -1257,6 +1462,8 @@
             this._pendingTexts.length = 0;
             this._lastFingerprint = "";
             this._pendingVisualKey = "";
+            this._recentBestQ = "";
+            this._recentBestAt = 0;
         }
 
         // After an answer is chosen: suppress the exact just-answered question until it
@@ -1319,6 +1526,23 @@
             const deduped = dedupeQuestion(text);
             const clean = truncateAtQuestionMark(deduped, deduped.includes("?") ? extractAnswers() : []);
             if (clean.length < 8 || clean.trim().split(/\s+/).length < 3) return;
+
+            // Some sites run a decorative scroll/reveal animation over the question text,
+            // rewriting the DOM to a SHRINKING trailing substring of the real text before it
+            // resettles. Each mid-animation substring still legitimately "looks like a
+            // question" (it keeps the trailing "?"), so without this guard every animation
+            // frame becomes its own ready-to-flush candidate — confirmed via logs to turn one
+            // plain-text question into a dozen wasted detection cycles before the AI was ever
+            // asked. If a longer candidate was seen recently and this new one is just a
+            // trailing suffix of it, it's the animation settling, not a new question — keep
+            // waiting for the text everyone already saw.
+            const now = performance.now();
+            if (this._recentBestQ && now - this._recentBestAt < RECENT_BEST_WINDOW_MS &&
+                clean.length < this._recentBestQ.length && this._recentBestQ.endsWith(clean)) {
+                return;
+            }
+            if (clean.length >= this._recentBestQ.length) { this._recentBestQ = clean; this._recentBestAt = now; }
+
             if (isBetterCandidate(clean, this._candidateQ)) this._candidateQ = clean;
         }
 
@@ -1331,7 +1555,7 @@
                 const q = this._candidateQ;
                 this._candidateQ = "";
                 this._candidateTimer = null;
-                if (q) this._tryRecord(q);
+                if (q) this._tryRecord(q, "A");   // "A" = MutationObserver plan (diagnostic only)
             }, delay);
         }
 
@@ -1349,32 +1573,24 @@
             const currentVisualKey = needsVision(freshQ) ? visualFingerprint() : "";
             const sameAnswers = current.join("|") === this._currentOptions.join("|");
             const sameVisual = currentVisualKey === this._currentVisualKey;
-            // Nothing actionable, or nothing changed (e.g. a decorative image swap).
-            if ((current.length < 2 && !currentVisualKey) || (sameAnswers && sameVisual)) {
-                this._pendingVisualKey = "";   // stable again — clear any half-confirmed flap
-                return;
-            }
-            // A visual-only change (same options, only the image fingerprint differs) has to
-            // show up on TWO CONSECUTIVE polls before we act on it. visualFingerprint() keys off
-            // img src/currentSrc, and some sites re-render that element with a churning src
-            // (cache-busted URL, srcset re-resolution, …) for the SAME still-on-screen image —
-            // reacting to a single-tick flicker re-runs the whole solve, including a fresh
-            // screenshot + AI call, for a question that never actually changed. That's exactly
-            // what stacks up into several-second delays on flag/image questions. A genuinely
-            // new image is still on screen ~150ms later (one more poll), so this costs real
-            // detection nothing while filtering out the flap. Option changes are a much
-            // stronger signal (real new DOM content, not just a src string) and still act
-            // immediately, undebounced.
-            if (sameAnswers && !sameVisual) {
-                if (this._pendingVisualKey !== currentVisualKey) { this._pendingVisualKey = currentVisualKey; return; }
-            } else {
-                this._pendingVisualKey = "";
-            }
-            this._tryRecord(freshQ);
+            const sameQuestionText = freshQ === this._currentQuestion;
+            // Nothing actionable, or nothing changed (e.g. a decorative image swap). An
+            // open-ended question with no option buttons and no image would otherwise NEVER
+            // re-poll at all — scanForCurrentQuestion() is a live viewport scan (not tied to
+            // DOM mutations), so comparing its result against _currentQuestion is what catches
+            // a question that scrolled/rendered into view with no DOM change for Plan A
+            // (MutationObserver) to see — e.g. a long form with every question already in the
+            // DOM, or a virtualized list.
+            if (sameQuestionText && ((current.length < 2 && !currentVisualKey) || (sameAnswers && sameVisual))) return;
+            // A new flag with the SAME question text, new options, or new question text
+            // entirely → re-detect. (A visual-only change still has to be CONFIRMED before
+            // it's acted on — see _tryRecord's own debounce, shared with Plan A.)
+            this._tryRecord(freshQ, "B");   // "B" = visual/option poll plan (diagnostic only)
         }
 
         // ── Shared detection entry (from both plans) ──
-        _tryRecord(questionText) {
+        // `source` (A/B) is diagnostic-only — identifies which plan called in, for the logs.
+        _tryRecord(questionText, source) {
             if (this._paused) return;
             const answers = extractAnswers();
             const question = truncateAtQuestionMark(dedupeQuestion(questionText), answers);
@@ -1385,9 +1601,15 @@
             // Fingerprint excludes options so [] → [4 options] is ONE question; the
             // readiness gate handles option-waiting.
             const fingerprint = question + "\n" + visualKey;
-            if (fingerprint === this._suppressed) return;      // just-answered, unchanged
+            const qSnip = question.slice(0, 40);
+            // Diagnostic logging for the detection pipeline (suppressed/dedup/false-positive
+            // reset/visual-flap paths below) was removed once the churn issue it was tracking
+            // was confirmed fixed via real captured logs — only the genuinely new detections
+            // are worth keeping in the ring buffer now; see log("fill"/"submit") for the
+            // current focus (auto-select/submit reliability).
+            if (fingerprint === this._suppressed) return;       // just-answered, unchanged
             this._suppressed = "";                             // any different question clears suppression
-            if (fingerprint === this._lastFingerprint) return; // dedupe within this detection cycle
+            if (fingerprint === this._lastFingerprint) return;  // dedupe within this detection cycle
 
             // reset() (fired on a PREDICTED transition — a heuristic, not a certainty) clears
             // _lastFingerprint so a genuinely new question isn't blocked by stale dedup state.
@@ -1401,9 +1623,30 @@
             // real change still fires normally.
             if (fingerprint === this._currentQuestion + "\n" + this._currentVisualKey) {
                 this._lastFingerprint = fingerprint;
+                this._pendingVisualKey = "";                    // fully stable — clear any half-confirmed flap
                 return;
             }
 
+            // The question TEXT hasn't changed but the image fingerprint has — e.g. a
+            // background decoration (map embed, ad, unrelated image) is momentarily bigger
+            // than the actual question illustration while it's still loading, or a churning
+            // src on a still-unchanged image. Shared here (not just in Plan B) because both
+            // plans recompute visualFingerprint() independently and either can observe the
+            // flap. This needs confirming on TWO SEPARATE calls, from EITHER plan, before
+            // acting — a single sighting re-runs the whole pipeline, including a fresh
+            // screenshot + AI call, for a question that hasn't actually changed. A genuinely
+            // new image is still there the next time anything checks, so this costs real
+            // detection nothing.
+            if (question === this._currentQuestion && visualKey !== this._currentVisualKey) {
+                if (this._pendingVisualKey !== visualKey) {
+                    this._pendingVisualKey = visualKey;
+                    return;
+                }
+            } else {
+                this._pendingVisualKey = "";
+            }
+
+            log("detect", { via: source, q: qSnip, vk: visualKey });
             this._lastFingerprint = fingerprint;               // claim immediately (re-entry short-circuits)
             const seq = ++this._detectSeq;
             this._cancelGate();
@@ -1617,8 +1860,14 @@
             this.overlay.setStatus("asking");
             this._loading = true;
             this.overlay.showLoading(needsVision(question) ? "Reading the screenshot…" : "Thinking…");
-            log("question", { q: question, opts: options, count: this.questionCount });
-            this._solve(question, options, myId, { autoFill: false });
+            log("question", { q: question, vk: visualKey, opts: options, count: this.questionCount, reqId: myId });
+            // Auto-select by default once the answer is ready — AnswerFiller's own retry loop
+            // already waits out a disabled/not-yet-rendered button, so AUTOANSWER_MS just
+            // needs to cover one paint, not "wait for it to become clickable". The answer
+            // stays clickable regardless (see showAnswer), so a failed/skipped auto-fill —
+            // or wanting to pick something else instead — still has a manual fallback: click
+            // the suggested answer, or any other option on the page.
+            this._solve(question, options, myId, { autoFill: AUTOANSWER_MS });
         }
 
         _solve(question, options, myId, { imageDataUrl = null, autoFill = false } = {}) {
@@ -1663,26 +1912,31 @@
         }
 
         // An answer was chosen (by us or the user) — the user has moved on, so abandon any
-        // in-flight solve for this question rather than waste an answer they won't use, AND
-        // reset the overlay to idle right away so we're visibly ready for the next question
-        // instead of leaving the just-answered card (accent, badge, reasoning) lingering
-        // until the next question happens to render. Previously this reset only ran when a
-        // solve was still in flight, so clicking an option on an already-answered question
-        // left stale content on screen.
+        // in-flight solve for this question rather than waste an answer they won't use. If a
+        // solve was still in flight there's nothing useful to show for it, so clear the
+        // spinner; if an answer was already shown, just dim it to "stale" rather than
+        // replacing it — the actual answer stays visible/readable, and the page's own
+        // buttons are always live, so clicking a different option to override it still works.
         onReset() {
             log("reset", {});
             this._lastAnswerAt = Date.now();
-            if (this._loading) { this.reqId++; this._loading = false; }
             this.overlay.setStatus("idle");
-            this.overlay.showIdle("Answer selected.");
-            this.overlay.clearAnswerAccent();
+            if (this._loading) {
+                this.reqId++;
+                this._loading = false;
+                this.overlay.showIdle("Answer selected.");
+            } else {
+                this.overlay.clearAnswerAccent();
+            }
         }
 
-        // Apply the AI's answer to the page. suppressCurrent() also covers open-ended,
-        // where no page answer-click fires the lifecycle reset — and for the same reason
-        // (open-ended has no matching lifecycleReset click) we reset the overlay here too,
-        // not just in onReset(). Guarded on !_loading so this can't clobber a NEW question's
-        // "Thinking…" if one started detecting in the moment between showAnswer and the click.
+        // Apply the AI's answer to the page. suppressCurrent() also covers open-ended, where
+        // no page answer-click fires the lifecycle reset — and for the same reason we mark
+        // the overlay's answer filled here too, not just in onReset(). Marks it (strikethrough)
+        // rather than replacing the card with a generic message, so the answer stays visible —
+        // useful if you want to double-check it or click a different option instead. Guarded
+        // on !_loading so this can't clobber a NEW question's "Thinking…" if one started
+        // detecting in the moment between showAnswer and the click.
         onFill(fillText, isMC) {
             return this.filler.fill(fillText, isMC).then(ok => {
                 if (ok) {
@@ -1690,8 +1944,7 @@
                     this._lastAnswerAt = Date.now();
                     if (!this._loading) {
                         this.overlay.setStatus("idle");
-                        this.overlay.showIdle("Answer selected.");
-                        this.overlay.clearAnswerAccent();
+                        this.overlay.markAnswerFilled();
                     }
                 }
                 return ok;
@@ -1725,11 +1978,12 @@
                     this.overlay.showError(error || "Screenshot failed — check extension permissions");
                     return;
                 }
-                this._solve(freshQ || "What is shown in this image?", scanAns, myId, { imageDataUrl: dataUrl, autoFill: true });
+                this._solve(freshQ || "What is shown in this image?", scanAns, myId, { imageDataUrl: dataUrl, autoFill: AUTOFILL_MS });
             });
         }
 
-        // Nudge submitted — re-ask the current question with the hint (no auto-fill).
+        // Nudge submitted — re-ask the current question with the hint, then auto-fill (same
+        // pacing as manual rescan, since this is also a deliberate, manually-triggered ask).
         onNudgeSubmit() {
             this.overlay.saveNudge();
             this.overlay.closeNudgePanel();
@@ -1743,7 +1997,7 @@
             this._loading = true;
             this.overlay.showLoading("Re-asking with your hint…");
             log("call", { mode: "nudge" });
-            this._solve(this.currentQuestion, ans, myId, { autoFill: false });
+            this._solve(this.currentQuestion, ans, myId, { autoFill: AUTOFILL_MS });
         }
     }
 
@@ -2099,9 +2353,11 @@
             // constants
             constants: {
                 VOTE_CONF, VOTE_SAMPLES, VOTE_TEMP, DEBOUNCE_MS, DEBOUNCE_Q_MS,
-                GATE_INTERVAL_MS, GATE_MAX_MS, OPEN_GRACE_MS, RESET_COOLDOWN_MS,
+                GATE_INTERVAL_MS, GATE_MAX_MS, OPEN_GRACE_MS, OPEN_FALLBACK_MS, RESET_COOLDOWN_MS,
                 LAYOUT_SHIFT_PX, TRANSITION_REFRACTORY_MS, VISUAL_POLL_MS, SUBMIT_RETRIES,
-                SCREENSHOT_SETTLE_MS, CAPTURE_FADE_OUT_MS, CAPTURE_FADE_IN_MS
+                SCREENSHOT_SETTLE_MS, CAPTURE_FADE_OUT_MS, CAPTURE_FADE_IN_MS, RECENT_BEST_WINDOW_MS,
+                AUTOFILL_MS, AUTOANSWER_MS, SELECT_CONFIRM_BUDGET_MS, SELECT_CONFIRM_POLL_MS,
+                SELECT_CONFIRM_MAX_TRIES, SELECT_BLIND_RETRIES, OPEN_FALLBACK_MS
             }
         });
     }

@@ -307,7 +307,16 @@ test('cas none when input but within grace', () => {
     resetDOM(); DOM.inputs = [mkEl('input', { type: 'text' })];
     eq('cas4', A.classifyAnswerSurface('What is x', 0).kind, 'none');
 });
-test('cas none when nothing', () => { resetDOM(); eq('cas5', A.classifyAnswerSurface('What is x', 9999).kind, 'none'); });
+test('cas none shortly after nothing renders', () => { resetDOM(); eq('cas5', A.classifyAnswerSurface('What is x', 500).kind, 'none'); });
+test('cas open (best-effort) once OPEN_FALLBACK_MS passes with no input ever found', () => {
+    // Confirmed via logs: a page whose answer input is slow/hard to detect otherwise made
+    // classifyAnswerSurface wait the FULL GATE_MAX_MS (5s) on every single open-ended
+    // question before ever asking the AI. The AI call doesn't need the input to exist yet
+    // (only the later fill step does), so this caps the wait well short of that.
+    resetDOM();
+    eq('cas6a', A.classifyAnswerSurface('What is x', A.constants.OPEN_FALLBACK_MS - 1).kind, 'none');
+    eq('cas6b', A.classifyAnswerSurface('What is x', A.constants.OPEN_FALLBACK_MS).kind, 'open');
+});
 
 group('visualFingerprint / findTextInput');
 test('vf picks large centered img', () => {
@@ -396,10 +405,129 @@ await atest('filler.fill open-ended types into input', async () => {
     var ok1 = await f.fill('Photosynthesis', false);
     ok('af5a', ok1); eq('af5b', input.value, 'Photosynthesis');
 });
+await atest('filler.fill open-ended retries FINDING the input if it is not there yet', async () => {
+    // Confirmed via logs: on a page whose answer input renders/becomes detectable a moment
+    // late, one failed findTextInput() call used to fall straight to "no_target" with no
+    // second look — unlike the MC button lookup, which already retried.
+    resetDOM();
+    var reads = 0;
+    var input = mkEl('input', { type: 'text', rect: R({ width: 200, height: 30 }) });
+    Object.defineProperty(input, 'readOnly', { get() { reads++; return reads < 3; } });  // "not ready" the first 2 checks
+    DOM.inputs = [input];
+    var f = new A.AnswerFiller();
+    var ok1 = await f.fill('Mercury', false);
+    ok('cf6a', ok1);
+    eq('cf6b', input.value, 'Mercury');
+    ok('cf6c', reads >= 3);
+});
 await atest('filler.fill MC no target → false', async () => {
     resetDOM(); var f = new A.AnswerFiller(); f.capture();
     var ok1 = await f.fill('Nothing', true);
     ok('af6', ok1 === false);
+});
+
+group('AnswerFiller — click confirmation retry');
+// A simulated click doesn't guarantee the page's own JS treated it as a selection — these
+// model a Try/Submit button that's gated on the option actually registering.
+await atest('fill() re-clicks when the submit button is still disabled, confirms once it enables', async () => {
+    resetDOM();
+    var submitBtn = mkEl('button', { text: 'Submit', disabled: true });
+    var opt = mkEl('button', { text: 'Blue' });
+    var clicks = 0;
+    var realClick = opt.click.bind(opt);
+    opt.click = function () { clicks++; realClick(); if (clicks >= 2) submitBtn.disabled = false; };
+    DOM.buttons = [opt, submitBtn];
+    var f = new A.AnswerFiller(); f.capture();
+    var ok1 = await f.fill('Blue', true);
+    ok('cf1a', ok1);
+    eq('cf1b', clicks, 2);              // 1st click didn't register (submit stayed disabled) — retried once
+    ok('cf1c', submitBtn._clicked, 'autoSubmit should click Submit once it is confirmed enabled');
+});
+test('fill() confirms immediately via aria-pressed even if a submit button stays disabled', () => {
+    resetDOM();
+    var submitBtn = mkEl('button', { text: 'Submit', disabled: true });
+    var opt = mkEl('button', { text: 'Blue' });
+    opt.getAttribute = attr => attr === 'aria-pressed' ? 'true' : null;
+    DOM.buttons = [opt, submitBtn];
+    var f = new A.AnswerFiller(); f.capture();
+    var clicks = 0;
+    var realClick = opt.click.bind(opt);
+    opt.click = function () { clicks++; realClick(); };
+    f.fill('Blue', true);
+    eq('cf2', clicks, 1);               // aria-pressed="true" is enough — no retry needed
+});
+await atest('fill() confirms via "options locked" when there is no submit button at all (quiz.com MC: click = submit)', async () => {
+    // Confirmed via logs: quiz.com's MC flow has NO Try/Submit button whatsoever — clicking
+    // an option submits immediately. findSubmitButton() finding nothing meant the OLD
+    // definitelyFailed check (!!btn && ...) could never be true there, so every click was
+    // reported "confirmed" on the first try regardless of whether it actually registered.
+    // Locked options (disabled, or fewer live options than before) is the positive signal
+    // available on exactly this kind of platform instead.
+    resetDOM();
+    var opt = mkEl('button', { text: 'Blue' });
+    var other = mkEl('button', { text: 'Red' });
+    var realClick = opt.click.bind(opt);
+    opt.click = function () { realClick(); opt.disabled = true; };   // the page locks the choice once clicked
+    DOM.buttons = [opt, other];   // no Submit/Try button anywhere
+    var f = new A.AnswerFiller(); f.capture();
+    var ok1 = await f.fill('Blue', true);
+    ok('cf7', ok1);
+});
+await atest('fill() does a few quick blind retries, then accepts best-effort, when there is NO signal in either direction', async () => {
+    // This is the exact bug the logs caught: no Submit button (so no negative evidence
+    // ever fires) AND nothing gets locked/marked selected either — previously accepted as
+    // "confirmed" on the very first click with zero verification. Now it at least re-clicks
+    // a few times before accepting, rather than trusting a single unconfirmed click.
+    resetDOM();
+    var clicks = 0;
+    var opt = mkEl('button', { text: 'Blue' });
+    var realClick = opt.click.bind(opt);
+    opt.click = function () { clicks++; realClick(); };   // never locks, never shows any signal
+    DOM.buttons = [opt];   // no other options, no submit button anywhere
+    var f = new A.AnswerFiller(); f.capture();
+    var ok1 = await f.fill('Blue', true);
+    ok('cf8a', ok1);                                            // best-effort accept, not stuck forever
+    eq('cf8b', clicks, 1 + A.constants.SELECT_BLIND_RETRIES);   // 1 initial click + the blind retries
+});
+await atest('fill() gives up after the confirm budget if selection never registers — manual click stays available', async () => {
+    // Slow on purpose (~2s wall-clock): SELECT_CONFIRM_BUDGET_MS is a real Date.now()
+    // deadline, not a mockable virtual clock, so this genuinely waits it out.
+    resetDOM();
+    var submitBtn = mkEl('button', { text: 'Submit', disabled: true });   // never becomes enabled
+    var opt = mkEl('button', { text: 'Blue' });
+    DOM.buttons = [opt, submitBtn];
+    var f = new A.AnswerFiller(); f.capture();
+    var ok1 = await f.fill('Blue', true);
+    ok('cf3a', ok1 === false);   // never confirmed → resolves false, so a manual click still works
+    ok('cf3b', opt._clicked);    // it DID try, repeatedly, before giving up
+    ok('cf3c', !submitBtn._clicked, 'never confirmed selection → must not auto-submit');
+});
+// Open-ended answers get the SAME confirm-and-retry treatment — a controlled input can
+// silently reject/revert a programmatic value, which is exactly what "typed the right
+// answer but submitted as if nothing was entered" looks like.
+await atest('fill() retries a typed answer that a controlled input rejects on the first write', async () => {
+    resetDOM();
+    var writes = 0, real = '';
+    var input = mkEl('input', { type: 'text', rect: R({ width: 200, height: 30 }) });
+    Object.defineProperty(input, 'value', {
+        get() { return real; },
+        set(v) { writes++; if (writes >= 2) real = v; }   // rejects the first write, accepts the 2nd
+    });
+    DOM.inputs = [input];
+    var f = new A.AnswerFiller();
+    var ok1 = await f.fill('Mercury', false);
+    ok('cf4a', ok1);
+    eq('cf4b', writes, 2);
+    eq('cf4c', input.value, 'Mercury');
+});
+await atest('fill() gives up on a typed answer that never sticks — resolves false', async () => {
+    resetDOM();
+    var input = mkEl('input', { type: 'text', rect: R({ width: 200, height: 30 }) });
+    Object.defineProperty(input, 'value', { get() { return ''; }, set() {} });   // always rejects
+    DOM.inputs = [input];
+    var f = new A.AnswerFiller();
+    var ok1 = await f.fill('Mercury', false);
+    ok('cf5', ok1 === false);
 });
 
 group('OverlayUI — capture fade');
@@ -589,12 +717,14 @@ test('_visualTick debounces a visual-only flap — needs 2 consecutive polls bef
     eq('vt1c', d.length, 1);
     eq('vt1d', d[0].p.visualKey, 'img:flag2.png');
 });
-test('_visualTick never confirms a src that keeps alternating (no re-detect, no stuck state)', () => {
+test('visual-key debounce never confirms a src that keeps alternating (no re-detect, no stuck state)', () => {
+    // The debounce lives in the SHARED _tryRecord now (so Plan A benefits too), which
+    // re-reads visualFingerprint() itself independently of _visualTick's own read — so the
+    // src has to be a plain property stable for the whole poll (as real DOM state is),
+    // not a self-mutating getter that would toggle on each of the two reads per tick.
     resetDOM();
     DOM.buttons = [mkEl('button', { text: 'France' }), mkEl('button', { text: 'Spain' })];
-    var toggle = false;
     var img = mkEl('img', { rect: R({ width: 300, height: 200, top: 60, bottom: 260 }) });
-    Object.defineProperty(img, 'currentSrc', { get() { toggle = !toggle; return toggle ? 'a.png' : 'b.png'; } });
     DOM.imgs = [img];
     var bus = busRec(); var eng = new A.IngestionEngine(bus);
     eng._running = true;
@@ -603,8 +733,107 @@ test('_visualTick never confirms a src that keeps alternating (no re-detect, no 
     eng._currentVisualKey = 'img:seed.png';
     eng._lastFingerprint = 'Guess the flag shown?\nimg:seed.png';
 
-    for (var i = 0; i < 4; i++) { eng._lastPollAt = 0; eng._visualTick(0); }
+    for (var i = 0; i < 4; i++) {
+        img.currentSrc = img.src = (i % 2 === 0) ? 'a.png' : 'b.png';   // alternates between polls only
+        eng._lastPollAt = 0;
+        eng._visualTick(0);
+    }
     eq('vt2', bus._log.filter(x => x.e === 'questionDetected').length, 0);
+});
+test('the visual-key debounce also protects Plan A (MutationObserver), not just Plan B', () => {
+    resetDOM();
+    DOM.buttons = [mkEl('button', { text: 'France' }), mkEl('button', { text: 'Spain' })];
+    var bus = busRec(); var eng = new A.IngestionEngine(bus);
+    eng._currentQuestion = 'Guess the flag shown?';
+    eng._currentOptions = ['France', 'Spain'];
+    eng._currentVisualKey = 'img:flag1.png';
+    eng._lastFingerprint = 'Guess the flag shown?\nimg:flag1.png';
+    DOM.imgs = [Object.assign(
+        mkEl('img', { rect: R({ width: 300, height: 200, top: 60, bottom: 260 }) }),
+        { src: 'flag2.png', currentSrc: 'flag2.png' }
+    )];
+
+    eng._tryRecord('Guess the flag shown?', 'A');    // 1st sighting via Plan A — not enough alone
+    eq('vt3a', bus._log.filter(x => x.e === 'questionDetected').length, 0);
+    eng._tryRecord('Guess the flag shown?', 'A');    // 2nd, CONFIRMING sighting via Plan A → acts
+    var d = bus._log.filter(x => x.e === 'questionDetected');
+    eq('vt3b', d.length, 1);
+    eq('vt3c', d[0].p.visualKey, 'img:flag2.png');
+});
+// Confirmed via a real captured log: an open-ended question (no option buttons, no image)
+// on a page where new questions appear via scroll/virtualization rather than a DOM mutation
+// Plan A can see used to never get re-checked at all — _visualTick bailed out purely on
+// "no buttons and no image", never comparing the question TEXT itself.
+test('_visualTick now checks an open-ended question text change even with no buttons/image', () => {
+    resetDOM();
+    var eng = new A.IngestionEngine(new A.EventBus());
+    eng._running = true;
+    eng._currentQuestion = 'Old open-ended question here?';
+    eng._currentOptions = [];
+    eng._currentVisualKey = '';
+    DOM.textEls = [mkEl('h2', { text: 'A brand new open-ended question appears?', rect: R({ width: 400 }) })];
+    var called = null;
+    eng._tryRecord = q => { called = q; };   // spy — isolate _visualTick's own decision
+    eng._lastPollAt = 0;
+    eng._visualTick(0);
+    ok('vb1', called !== null, 'expected _tryRecord to fire for the new question text');
+});
+test('_visualTick still skips when nothing — including the question text — changed', () => {
+    resetDOM();
+    var eng = new A.IngestionEngine(new A.EventBus());
+    eng._running = true;
+    eng._currentQuestion = 'Same open-ended question here?';
+    eng._currentOptions = [];
+    eng._currentVisualKey = '';
+    DOM.textEls = [mkEl('h2', { text: 'Same open-ended question here?', rect: R({ width: 400 }) })];
+    var called = false;
+    eng._tryRecord = () => { called = true; };
+    eng._lastPollAt = 0;
+    eng._visualTick(0);
+    ok('vb2', !called);
+});
+
+group('IngestionEngine — decorative text-reveal animation guard');
+// Modeled directly on a real captured log: one plain-text question fired ~12 spurious
+// detection cycles (each bumping the overlay's counter) before the AI was ever asked,
+// because the site rewrites the question DOM to a shrinking trailing substring of the
+// real text while it visually "reveals" it — and each shrunken substring still legitimately
+// ends in "?", so it used to sail through as its own complete, ready-to-flush candidate.
+test('a shrinking trailing-substring rewrite of the SAME question does not replace the full candidate', () => {
+    // Mirrors the real flush cycle from the captured log: each fragment arrived ~150ms
+    // apart — its own flush, with _candidateQ reset to "" beforehand. That reset is exactly
+    // what let a shorter fragment win before (isBetterCandidate("", anything) => true) —
+    // _recentBestQ is the separate, flush-cycle-surviving memory that now blocks it.
+    resetDOM();
+    var bus = busRec(); var eng = new A.IngestionEngine(bus);
+    var full = 'What is the largest ocean on Earth?';
+    eng._processText(full);
+    eq('ra1a', eng._candidateQ, full);
+    [
+        'at is the largest ocean on Earth?', 'is the largest ocean on Earth?',
+        's the largest ocean on Earth?', 'the largest ocean on Earth?',
+        'he largest ocean on Earth?', 'largest ocean on Earth?'
+    ].forEach(fragment => {
+        eng._candidateQ = '';           // simulate the flush that would have consumed it
+        eng._processText(fragment);
+    });
+    eq('ra1b', eng._candidateQ, '');    // every shrinking fragment was rejected, none became a candidate
+});
+test('a genuinely different (non-suffix) question still replaces the candidate immediately', () => {
+    resetDOM();
+    var bus = busRec(); var eng = new A.IngestionEngine(bus);
+    eng._processText('What is the largest ocean on Earth?');
+    eng._processText("Which planet is known as the 'Red Planet'?");
+    eq('ra2', eng._candidateQ, "Which planet is known as the 'Red Planet'?");
+});
+test('a shorter candidate is accepted again once the protection window has elapsed', () => {
+    resetDOM();
+    var bus = busRec(); var eng = new A.IngestionEngine(bus);
+    eng._processText('What is the largest ocean on Earth?');
+    eng._candidateQ = '';                                              // simulate a flush having consumed it
+    eng._recentBestAt -= (A.constants.RECENT_BEST_WINDOW_MS + 100);    // simulate real time passing
+    eng._processText('largest ocean on Earth?');
+    eq('ra3', eng._candidateQ, 'largest ocean on Earth?');
 });
 
 group('TransitionSensor');
@@ -678,6 +907,16 @@ await atest('orchestrator answers a detected MC question', async () => {
     ok('or1c', askCalls().some(c => c.question === 'Capital of France?'));
     ok('or1d', app._loading === false);
 });
+await atest('orchestrator auto-selects the answer by default — no manual click needed', async () => {
+    installEnv();
+    CHROME.askAI = [{ answer: 'Paris', answerIndex: 1, inRange: true, confidence: 0.95, provider: 'gemini' }];
+    var app = new A.Orchestrator(); app.start();
+    var paris = mkEl('button', { text: 'Paris' });
+    DOM.buttons = [mkEl('button', { text: 'London' }), paris];
+    app.onQuestionDetected({ question: 'Capital of France?', options: ['London', 'Paris'], visualKey: '' });
+    await flush(60);
+    ok('af7a', paris._clicked === true);   // clicked automatically, without the user touching the overlay
+});
 await atest('orchestrator back-pressure: reqId increments per detection', async () => {
     installEnv();
     CHROME.askAI = [
@@ -728,44 +967,54 @@ await atest('orchestrator onFill suppresses re-detection', async () => {
     ok('or6a', ok1);
     ok('or6b', app.ingestion._suppressed === 'Blue?\n', 'ingestion should suppress the answered fingerprint');
 });
-test('orchestrator onReset resets the overlay to idle even when nothing was loading', () => {
+test('orchestrator onReset dims an already-shown answer (not replaced) when nothing was loading', () => {
+    // A "retry with a different option" complaint: replacing the shown answer with a generic
+    // "Answer selected." message hid what was actually picked. Now it's just dimmed (accent
+    // cleared), the answer itself stays visible and readable.
     installEnv();
     var app = new A.Orchestrator(); app.start();
     var idleCalls = 0, statusLog = [], accentCalls = 0;
     app.overlay.showIdle = () => idleCalls++;
     app.overlay.setStatus = s => statusLog.push(s);
     app.overlay.clearAnswerAccent = () => accentCalls++;
-    app._loading = false;              // answer already shown; nothing in flight — the previous gap
+    app._loading = false;              // answer already shown; nothing in flight
     app.onReset({});
-    eq('or7a', idleCalls, 1);
+    eq('or7a', idleCalls, 0);          // NOT replaced with a generic message
     ok('or7b', statusLog.indexOf('idle') !== -1);
-    eq('or7c', accentCalls, 1);
+    eq('or7c', accentCalls, 1);        // just dimmed
 });
-await atest('orchestrator onFill resets the overlay to idle on success (covers open-ended, no lifecycleReset)', async () => {
+test('orchestrator onReset still clears a stuck spinner when a solve was interrupted mid-flight', () => {
+    installEnv();
+    var app = new A.Orchestrator(); app.start();
+    var idleCalls = 0;
+    app.overlay.showIdle = () => idleCalls++;
+    app._loading = true;               // a solve was in flight with nothing to show for it yet
+    app.onReset({});
+    eq('or7d', idleCalls, 1);          // spinner cleared — there's genuinely nothing else to show
+});
+await atest('orchestrator onFill marks the answer filled on success (covers open-ended, no lifecycleReset)', async () => {
     installEnv();
     var app = new A.Orchestrator(); app.start();
     DOM.inputs = [mkEl('input', { type: 'text', rect: R({ width: 200, height: 30 }) })];
-    var idleCalls = 0, accentCalls = 0;
-    app.overlay.showIdle = () => idleCalls++;
-    app.overlay.clearAnswerAccent = () => accentCalls++;
+    var markCalls = 0;
+    app.overlay.markAnswerFilled = () => markCalls++;
     app._loading = false;
     var ok1 = await app.onFill('Mercury', false);   // open-ended: fillInput, not a page click
     ok('or8a', ok1);
-    eq('or8b', idleCalls, 1);
-    eq('or8c', accentCalls, 1);
+    eq('or8b', markCalls, 1);          // the answer stays visible, just marked applied
 });
 await atest('orchestrator onFill does NOT clobber a new question that started loading mid-fill', async () => {
     installEnv();
     var app = new A.Orchestrator(); app.start();
     DOM.buttons = [mkEl('button', { text: 'Blue' }), mkEl('button', { text: 'Submit' })];
     app.filler.capture();
-    var idleCalls = 0;
-    app.overlay.showIdle = () => idleCalls++;
+    var markCalls = 0;
+    app.overlay.markAnswerFilled = () => markCalls++;
     var p = app.onFill('Blue', true);
     app._loading = true;               // a NEW question began detecting before onFill resolved
     var ok1 = await p;
     ok('or9a', ok1);
-    eq('or9b', idleCalls, 0);          // must not stomp the new question's "Thinking…" state
+    eq('or9b', markCalls, 0);          // must not touch the new question's "Thinking…" state
 });
 
 // ══════════════════════════════════════════════════════════════════════════════

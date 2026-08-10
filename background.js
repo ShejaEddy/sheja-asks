@@ -103,6 +103,9 @@ function questionTypeHint(q) {
         hints.push("- ORDERING: choose the option whose items are in the correct order/sequence.");
     if (/\bmatch\b|matches|corresponds|goes with|paired with/.test(l))
         hints.push("- MATCHING: pick the option that correctly pairs the items.");
+    if (/necessarily follow|logically (drawn|follow|conclude)|does it follow that/.test(l) ||
+        (/\ball\b[^.?]*\bare\b/.test(l) && /\bsome\b[^.?]*\bare\b/.test(l)))
+        hints.push("- SYLLOGISM: a categorical-logic question. Treat \"all A are B\" as A⊆B and \"some A are B\" as A∩B≠∅, and pick ONLY what necessarily follows from COMBINING every premise together — not a bare restatement of a single premise alone (e.g. given \"some A are B\", the option \"some B are A\" says nothing new and is usually a distractor, not the intended answer) and not an unjustified converse (\"all A are B\" does NOT mean \"all B are A\"). If two options both look technically true, prefer the one that genuinely chains ALL the premises over one that just repeats a single premise.");
     if (/what year|which year|in what year|in which year|what date/.test(l))
         hints.push("- YEAR/DATE: answer with the specific year/date.");
     if (l.startsWith("what is") || l.startsWith("what are") || l.startsWith("define") || l.startsWith("what does"))

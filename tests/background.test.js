@@ -63,6 +63,27 @@ test('DESIGN: hints accumulate (negation + superlative together)', () => {
     var h = B.questionTypeHint('Which of these is NOT the largest?');
     has('qh-combo1', h, 'NEGATION'); has('qh-combo2', h, 'SUPERLATIVE');
 });
+// Recurring pattern across several captured logs this session — the model repeatedly
+// answered these categorical-syllogism questions with a trivial restatement of one premise
+// instead of the conclusion that actually chains both premises together.
+test('syllogism hint: "does it necessarily follow"', () => {
+    has('qh-syl1', B.questionTypeHint(
+        'All roses are flowers. Some flowers are red. Does it necessarily follow that some roses are red?'
+    ), 'SYLLOGISM');
+});
+test('syllogism hint: "logically drawn" conclusion wording', () => {
+    has('qh-syl2', B.questionTypeHint(
+        'Which of the following conclusions can be logically drawn from the statements?'
+    ), 'SYLLOGISM');
+});
+test('syllogism hint: all/some quantifier structure without explicit "follow" wording', () => {
+    has('qh-syl3', B.questionTypeHint(
+        'If some actors are singers and all singers are dancers, which of the following is true?'
+    ), 'SYLLOGISM');
+});
+test('syllogism hint does NOT fire on an unrelated all/some-free question', () => {
+    hasNot('qh-syl4', B.questionTypeHint('What is the capital of France?'), 'SYLLOGISM');
+});
 test('plain question → no hint', () => eq('qh-plain', B.questionTypeHint('Which planet do we live on'), ''));
 
 // ══════════════════════════════════════════════════════════════════════════════
